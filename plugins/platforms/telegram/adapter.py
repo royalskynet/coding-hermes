@@ -8763,6 +8763,21 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    # === [local-patch] inbound audit (realcmd 20260729) ===
+    _tg_audit_last_update_id: int = 0
+
+    def _audit_inbound(self, update: Update, text: str, chat_id) -> None:
+        """Log inbound update with gap detection."""
+        uid = update.update_id
+        if self._tg_audit_last_update_id and uid > self._tg_audit_last_update_id + 1:
+            logger.warning(
+                "[TG-AUDIT] gap: expected %d got %d (missed %d updates)",
+                self._tg_audit_last_update_id + 1, uid,
+                uid - self._tg_audit_last_update_id - 1,
+            )
+        self._tg_audit_last_update_id = uid
+        logger.info("[TG-AUDIT] update_id=%s chat=%s len=%d", uid, chat_id, len(text or ""))
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -8788,6 +8803,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
+        self._audit_inbound(update, msg.text, getattr(msg, "chat_id", getattr(msg.chat, "id", None) if msg.chat else None))
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
@@ -8810,6 +8826,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        self._audit_inbound(update, msg.text, getattr(msg, "chat_id", getattr(msg.chat, "id", None) if msg.chat else None))
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)

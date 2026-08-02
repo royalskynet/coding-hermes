@@ -3067,6 +3067,23 @@ def _replay_output_history() -> None:
         _OUTPUT_HISTORY_REPLAYING = False
 
 
+def _cnotice(text: str):
+    """Runtime notice channel — always goes to stderr, never stdout.
+
+    [local-patch] For provider-fallback / auth-failure / rate-limit lines
+    that subprocess consumers (line_server, gateways) capture stdout from —
+    keeps notices visible to humans on a TTY but out of the agent reply
+    body downstream.
+    """
+    import sys as _sys
+    _record_output_history(text)
+    try:
+        _sys.stderr.write(text + "\n")
+        _sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's native renderer.
 
@@ -10650,6 +10667,85 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass  # Non-fatal — never break the main loop
 
+    def _maybe_arm_auto_goal_after_max_iterations(self, user_input: Any = None) -> None:
+        """[local-patch] A2-c (CLI half): arm a system-owned goal when the
+        turn just ended on max_iterations and no goal loop is running.
+
+        Called immediately before ``_maybe_continue_goal_after_turn`` at the
+        turn boundary, so that hook — which returns early unless
+        ``is_active()`` — has an active goal to drive. Adds no continuation
+        machinery of its own; the turn budget, judge and pause/resume stop
+        conditions all come from the existing goal loop.
+        See fixindex 0032-max-iterations-no-continuation.
+        """
+        mgr = self._get_goal_manager()
+        if mgr is None:
+            return
+
+        agent = getattr(self, "agent", None)
+        hit = bool(getattr(agent, "_last_turn_hit_max_iterations", False)) if agent else False
+
+        # Record the flag even when a user-set goal is already running: its
+        # next continuation prompt also has to cancel the "stop calling
+        # tools" message handle_max_iterations left in the transcript.
+        try:
+            mgr.note_max_iterations(hit)
+        except Exception as exc:
+            logging.debug("auto-goal: note_max_iterations failed: %s", exc)
+
+        if not hit or mgr.is_active():
+            return
+
+        goal_text = ""
+        if isinstance(user_input, str):
+            goal_text = user_input.strip()
+        if not goal_text:
+            # Fall back to the first user message of this session.
+            try:
+                for msg in self.conversation_history or []:
+                    if msg.get("role") != "user":
+                        continue
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            p.get("text", "")
+                            for p in content
+                            if isinstance(p, dict) and p.get("type") in {"text", "output_text"}
+                        )
+                    if str(content or "").strip():
+                        goal_text = str(content).strip()
+                        break
+            except Exception:
+                pass
+
+        try:
+            state = mgr.ensure_auto_goal(goal_text)
+        except Exception as exc:
+            logging.debug("auto-goal: ensure_auto_goal failed: %s", exc)
+            return
+
+        if state is None:
+            logging.info(
+                "auto.continue: max_iterations stop but no auto goal armed "
+                "(empty goal text, or an existing paused/active goal blocks re-arming)"
+            )
+            return
+
+        logging.info(
+            "auto.continue: armed auto goal after max_iterations stop — budget=%d goal=%r",
+            state.max_turns, state.goal[:120],
+        )
+        _cprint(
+            f"  {_DIM}↻ Iteration budget was exhausted — continuing automatically "
+            f"under a {state.max_turns}-turn goal budget. /goal status to inspect, "
+            f"/goal clear to stop.{_RST}"
+        )
+        try:
+            if agent is not None:
+                agent._last_turn_hit_max_iterations = False
+        except Exception:
+            pass
+
     def _maybe_continue_goal_after_turn(self) -> None:
         """Hook run after every CLI turn. Judges + maybe re-queues.
 
@@ -17480,6 +17576,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # continuation prompt back into _pending_input so the
                         # next loop iteration picks it up naturally (and any
                         # user input that arrives in between still preempts).
+                        # [local-patch] A2-c: OR-branch before the goal hook.
+                        # If this turn stopped on max_iterations and no goal
+                        # loop is running, arm a system-owned goal first so
+                        # the hook below has something active to continue —
+                        # previously the turn just ended here with the task
+                        # unfinished and auto.continue never fired.
+                        # See fixindex 0032-max-iterations-no-continuation.
+                        try:
+                            self._maybe_arm_auto_goal_after_max_iterations(user_input)
+                        except Exception as _auto_goal_exc:
+                            logging.debug("auto-goal arming failed: %s", _auto_goal_exc)
+
                         try:
                             self._maybe_continue_goal_after_turn()
                         except Exception as _goal_exc:

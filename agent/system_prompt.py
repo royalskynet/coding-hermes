@@ -511,6 +511,27 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
+    # [local-patch] Standing /goal block — volatile tier so it survives
+    # context compression (see agent/conversation_compression.py goal-state
+    # migration). GoalManager is keyed by session_id; without this block the
+    # goal only lived in state_meta and had no representation in the prompt
+    # the model actually sees turn to turn. Mirrors the memory block above:
+    # loaded fresh on every rebuild, never cached. See fixindex
+    # 0031-goal-lost-on-compression.
+    try:
+        from hermes_cli.goals import load_goal
+
+        _goal_state = load_goal(getattr(agent, "session_id", None) or "")
+        if _goal_state is not None and _goal_state.status in {"active", "paused"}:
+            _goal_lines = [f"Standing goal ({_goal_state.status}): {_goal_state.goal}"]
+            _pending_subgoals = _goal_state.render_subgoals_block()
+            if _pending_subgoals:
+                _goal_lines.append("Additional criteria added mid-loop:")
+                _goal_lines.append(_pending_subgoals)
+            volatile_parts.append("\n".join(_goal_lines))
+    except Exception:
+        pass
+
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
         try:

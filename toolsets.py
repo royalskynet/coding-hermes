@@ -353,6 +353,25 @@ TOOLSETS = {
     },
 
 
+    # [local-patch] LSP symbol tools — see fixindex 0030-lsp-symbol-tools-local-patch-reapply.
+    # LSP tools are intentionally NOT in _HERMES_CORE_TOOLS; profiles opt-in via platform_toolsets.
+    # Re-apply after hermes upgrade.
+    "lsp": {
+        "description": (
+            "Language Server Protocol tools for code navigation and symbol lookup. "
+            "Requires LSP enabled in config.yaml and a supported language server "
+            "available for the file's extension."
+        ),
+        "tools": [
+            "lsp_document_symbols",
+            "lsp_definition",
+            "lsp_references",
+            "lsp_workspace_symbols",
+        ],
+        "includes": []
+    },
+
+
     # Scenario-specific toolsets
     
     "debugging": {

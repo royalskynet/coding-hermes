@@ -1285,6 +1285,17 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # [local-patch] A2-a: reset the max-iterations flag with the rest of the
+    # once-per-turn state, so it always describes the turn about to run.
+    # (Upstream moved the IterationBudget rebuild out of this function, so
+    # the flag now anchors to this per-turn reset block instead.)
+    # Read at the gateway/CLI turn boundary to decide whether to arm an auto
+    # goal and continue. It lives on the agent instance, so the
+    # background_review fork agent (a separate AIAgent with max_iterations=16,
+    # never registered in the gateway agent cache or bound to cli.self.agent)
+    # sets only its own flag and cannot trigger continuation for the main
+    # session. See fixindex 0032-max-iterations-no-continuation.
+    agent._last_turn_hit_max_iterations = False
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -2118,6 +2129,12 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
+        # [local-patch] Gateway admission-busy (503) waits get their own
+        # budget so a queued request cannot eat the retry allowance meant for
+        # real failures — with api_max_retries=1 a single queue collision
+        # used to end the turn. See fixindex 0037.
+        admission_waits = 0
+        max_admission_waits = 5
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
@@ -4174,12 +4191,59 @@ def run_conversation(
                         agent.log_prefix,
                     )
 
+                # ── Gateway admission-busy backoff ────────────────────
+                # OmniRoute answers 503 chat_admission_busy when more heavy
+                # requests are in flight than OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT
+                # allows.  Nothing is broken — the queue is full and the same
+                # request succeeds after the advertised Retry-After.  Falling
+                # back is pointless because every fallback_chain entry shares
+                # the gateway, so wait and re-issue without spending a retry.
+                _admission_err = str(api_error).lower()
+                if (
+                    getattr(api_error, "status_code", None) == 503
+                    and (
+                        "chat_admission_busy" in _admission_err
+                        or "structurally heavy chat request capacity" in _admission_err
+                        or "chat admission capacity is temporarily unavailable" in _admission_err
+                    )
+                    and admission_waits < max_admission_waits
+                ):
+                    admission_waits += 1
+                    _wait_s = 1.0
+                    _hdrs = getattr(getattr(api_error, "response", None), "headers", None)
+                    if _hdrs and hasattr(_hdrs, "get"):
+                        _raw = _hdrs.get("retry-after") or _hdrs.get("Retry-After")
+                        if _raw:
+                            try:
+                                _wait_s = max(0.0, min(30.0, float(_raw)))
+                            except (TypeError, ValueError):
+                                pass
+                    logger.warning(
+                        "%sGateway admission busy — waiting %.1fs and re-issuing "
+                        "(%d/%d, retry budget untouched) %s",
+                        agent.log_prefix, _wait_s, admission_waits,
+                        max_admission_waits, agent._client_log_context(),
+                    )
+                    agent._emit_status(
+                        f"⏸️ 閘道排隊中，{_wait_s:.0f}s 後重送 "
+                        f"({admission_waits}/{max_admission_waits})"
+                    )
+                    agent._touch_activity(
+                        f"gateway admission backoff ({admission_waits}/{max_admission_waits})"
+                    )
+                    _adm_end = time.time() + _wait_s
+                    while time.time() < _adm_end:
+                        if agent._interrupt_requested:
+                            break
+                        time.sleep(0.2)
+                    continue
+
                 retry_count += 1
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
                 )
-                
+
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
                 _error_summary = agent._summarize_api_error(api_error)

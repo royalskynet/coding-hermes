@@ -1342,6 +1342,27 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 continue
             raise
+        except TypeError as exc:
+            # ChatGPT codex backend (https://chatgpt.com/backend-api/codex)
+            # can emit a terminal SSE event whose ``response.output`` is
+            # None (instead of an empty list).  The openai SDK's
+            # ``parse_response`` iterates ``response.output``
+            # unconditionally (openai/lib/_parsing/_responses.py:61) and
+            # raises ``TypeError: 'NoneType' object is not iterable``
+            # before our backfill logic can run.  The non-stream
+            # ``responses.create(stream=True)`` fallback iterates SSE
+            # events manually and already synthesises a terminal output
+            # from ``response.output_item.done`` deltas, so route there.
+            err_text = str(exc)
+            if "NoneType" not in err_text or "iterable" not in err_text:
+                raise
+            logger.warning(
+                "Responses stream parse_response saw response.output=None; "
+                "falling back to create(stream=True). %s err=%s",
+                agent._client_log_context(),
+                err_text,
+            )
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
 
         def _interrupt_or_superseded() -> bool:
             return bool(agent._interrupt_requested)

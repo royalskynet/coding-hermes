@@ -1033,7 +1033,13 @@ class LineAdapter(BasePlatformAdapter):
             if local_path:
                 media_urls.append(local_path)
                 media_types.append(media_type)
-            text = f"[{msg_type}]"
+            # [local-patch] show the file extension for document shares so
+            # the model knows what it received without downloading it.
+            if msg_type == "file":
+                suffix = Path(local_path).suffix if local_path else ".bin"
+                text = f"[file {suffix}]"
+            else:
+                text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
             text = f"[sticker: {', '.join(keywords)}]" if keywords else "[sticker]"

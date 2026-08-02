@@ -118,6 +118,9 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        # Prefetch raw-turn injection caps (config: plugins.hermes-memory-store)
+        self._prefetch_raw_max = int(self._config.get("prefetch_raw_max", 1))
+        self._prefetch_raw_max_age_days = int(self._config.get("prefetch_raw_max_age_days", 30))
 
     @property
     def name(self) -> str:
@@ -170,6 +173,7 @@ class HolographicMemoryProvider(MemoryProvider):
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
         self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
+        self._db_path = str(db_path)
         self._retriever = FactRetriever(
             store=self._store,
             temporal_decay_half_life=temporal_decay,
@@ -202,19 +206,218 @@ class HolographicMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Surface memory to the LLM with explicit temporal + source framing.
+
+        Distilled facts and raw conversation turns are presented in separate
+        sections with different framing. Raw turns get age-annotated ("3 天前
+        Ether 說過") so the LLM never mistakes a quoted utterance for current
+        truth — which is how the "你約她週二/週三" subject-flip happened.
+        """
         if not self._retriever or not query:
             return ""
         try:
             results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            distilled, raw = [], []
+            for r in results or []:
+                if r.get("kind") == "raw_turn" or r.get("category") == "imported_episodic":
+                    raw.append(r)
+                else:
+                    distilled.append(r)
+
+            blocks: list[str] = []
+
+            # Koko-only dream recall: when query mentions dreams, prepend
+            # narrative summaries from the dream_log so Koko can answer
+            # "你昨晚做了什麼夢" verbatim, without fabrication.
+            dream_block = self._koko_dream_block(query)
+            if dream_block:
+                blocks.append(dream_block)
+
+            # Koko-only milestone recall: surface relationship milestones
+            # to create "she remembers me" feel without explicit trigger.
+            milestone_block = self._koko_milestone_block(query)
+            if milestone_block:
+                blocks.append(milestone_block)
+
             if not results:
-                return ""
-            lines = []
-            for r in results:
-                trust = r.get("trust_score", r.get("trust", 0))
-                lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
-            return "## Holographic Memory\n" + "\n".join(lines)
+                return "\n\n".join(blocks)
+
+            if distilled:
+                lines = ["## 蒸餾記憶 (當前可用作真實的人物/關係/狀態)"]
+                for r in distilled:
+                    trust = r.get("trust_score", r.get("trust", 0))
+                    lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
+                blocks.append("\n".join(lines))
+
+            if raw:
+                # Apply raw-turn injection caps:
+                # 1. Skip raw turns older than _prefetch_raw_max_age_days (default 30d)
+                # 2. Limit to at most _prefetch_raw_max (default 1) highest-trust entries
+                from datetime import datetime
+                now = datetime.now()
+                max_age = self._prefetch_raw_max_age_days
+                aged_raw = []
+                for r in raw:
+                    created = r.get("created_at")
+                    if created:
+                        if isinstance(created, str):
+                            ts = created.replace("T", " ").split(".")[0]
+                            try:
+                                dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                dt = None
+                        else:
+                            dt = created
+                        if dt is not None and max_age >= 0:
+                            if (now - dt).days > max_age:
+                                continue
+                    aged_raw.append(r)
+                # Sort by trust descending, then limit
+                aged_raw.sort(key=lambda r: r.get("trust_score", r.get("trust", 0)), reverse=True)
+                aged_raw = aged_raw[: self._prefetch_raw_max]
+                if aged_raw:
+                    lines = [
+                        "## 過往對話片段 (歷史脈絡)",
+                        "讀法: 此處 Ether/Iris 的引述屬於當時當下說過的話。主詞照原樣保留,",
+                        "時間以括號中「(YYYY-MM-DD)」為準。引用時明說「之前你說過/我說過」,",
+                        "讓 Ether 知道你在回憶,而當前要回應的話題以他現在這句為主。",
+                    ]
+                    for r in aged_raw:
+                        trust = r.get("trust_score", r.get("trust", 0))
+                        age = self._format_age(r.get("created_at"))
+                        lines.append(f"- [{trust:.1f}{age}] {r.get('content', '')}")
+                    blocks.append("\n".join(lines))
+
+            return "\n\n".join(blocks)
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
+            return ""
+
+    _DREAM_KEYWORDS = ("夢", "昨晚", "夜裡", "做夢", "夢到", "夢見", "夢境")
+
+    def _koko_dream_block(self, query: str) -> str:
+        """Koko-only: surface latest dream narratives when query asks about dreams."""
+        db_path = getattr(self, "_db_path", "") or ""
+        if not db_path:
+            return ""
+        # Extract profile name: .../profiles/<name>/memory_store.db
+        try:
+            from pathlib import Path as _Path
+            parts = _Path(db_path).parts
+            profile_name = parts[-2] if len(parts) >= 2 else ""
+        except Exception:
+            return ""
+        if profile_name != "koko":
+            return ""
+        if not any(k in query for k in self._DREAM_KEYWORDS):
+            return ""
+        try:
+            import sqlite3 as _sqlite
+            conn = _sqlite.connect(db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT started_at, narrative FROM dream_log "
+                    "WHERE stage='dream' AND status='ok' AND narrative IS NOT NULL "
+                    "ORDER BY started_at DESC LIMIT 3"
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        lines = [
+            "## 我的夢境（給你講夢用）",
+            "以下是我的夢：夢是我夜裡的自由聯想，幫我連接記憶，不是事實紀錄。我引用它時會說明來源是夢。",
+            "讀法: 這是我做的夢，第一人稱。Ether 問「昨晚做什麼夢／你夢到什麼」時直接用這段內容講出來，不要捏造額外細節。",
+            "",
+        ]
+        for started_at, narrative in rows:
+            date = (started_at or "")[:10]
+            lines.append(f"- ({date}) {narrative}")
+        return "\n".join(lines)
+
+    _EMOTION_TRIGGERS = ("累", "想", "還記得", "好久沒", "最近", "謝謝", "辛苦", "難過", "開心", "終於", "好久了", "一直")
+
+    def _koko_milestone_block(self, query: str) -> str:
+        """Koko-only: surface relationship milestones on emotion triggers or 5% random."""
+        import random
+        db_path = getattr(self, "_db_path", "") or ""
+        if not db_path:
+            return ""
+        try:
+            from pathlib import Path as _Path
+            parts = _Path(db_path).parts
+            profile_name = parts[-2] if len(parts) >= 2 else ""
+        except Exception:
+            return ""
+        if profile_name != "koko":
+            return ""
+
+        emotion_hit = any(t in query for t in self._EMOTION_TRIGGERS)
+        random_hit = random.random() < 0.05  # 5% baseline
+        if not emotion_hit and not random_hit:
+            return ""
+
+        try:
+            from pathlib import Path as _Path
+            profile_dir = _Path(db_path).parent
+            milestones_path = profile_dir / "memory" / "milestones.jsonl"
+            if not milestones_path.exists():
+                return ""
+            import json as _json
+            items = []
+            for line in milestones_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(_json.loads(line))
+                except Exception:
+                    continue
+            if not items:
+                return ""
+            if emotion_hit:
+                # Pick most relevant by tag/fact keyword overlap
+                q_words = set(query)
+                scored = []
+                for item in items:
+                    score = sum(1 for t in item.get("tags", []) if any(c in query for c in t))
+                    score += item.get("weight", 0.5)
+                    scored.append((score, item))
+                scored.sort(key=lambda x: -x[0])
+                chosen = scored[0][1]
+            else:
+                chosen = random.choice(items)
+            fact = chosen.get("fact", "")
+            date = chosen.get("date", "")
+            if not fact:
+                return ""
+            return f"（背景記憶：{date} {fact}）"
+        except Exception as e:
+            logger.debug("milestone block failed: %s", e)
+            return ""
+
+    @staticmethod
+    def _format_age(created_at) -> str:
+        """Return ' · N天前' for a timestamp, or empty string if unparseable."""
+        if not created_at:
+            return ""
+        try:
+            from datetime import datetime
+            if isinstance(created_at, str):
+                # Handle both ISO and SQLite default formats
+                ts = created_at.replace("T", " ").split(".")[0]
+                dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+            else:
+                dt = created_at
+            days = (datetime.now() - dt).days
+            if days <= 0:
+                return " · 今天"
+            if days == 1:
+                return " · 昨天"
+            return f" · {days}天前"
+        except Exception:
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:

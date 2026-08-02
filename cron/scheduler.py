@@ -3715,7 +3715,43 @@ def run_job(
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+
+        # ── Koko secretary-voice guard ──────────────────────────────────────
+        # Only fires when running under the koko profile.  Checks the final
+        # LLM output against secretary_guard._passes_secretary_voice() before
+        # delivery.  Rejected messages are dropped (SILENT_MARKER) and logged
+        # to ~/.hermes/profiles/koko/logs/voice-reject.log with timestamp +
+        # first 200 chars + reason.  LLM judge failures conservatively pass.
+        if final_response and _get_hermes_home().name == "koko":
+            try:
+                import sys as _sys
+                _guard_dir = str(_get_hermes_home() / "cron")
+                if _guard_dir not in _sys.path:
+                    _sys.path.insert(0, _guard_dir)
+                from secretary_guard import _passes_secretary_voice
+                if not _passes_secretary_voice(final_response):
+                    import datetime as _dt
+                    _ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _log_path = _get_hermes_home() / "logs" / "voice-reject.log"
+                    _log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_log_path, "a", encoding="utf-8") as _lf:
+                        _lf.write(
+                            f"[{_ts}] job={job_name!r} reason=secretary_guard_blocked "
+                            f"text={final_response[:200]!r}\n"
+                        )
+                    logger.info(
+                        "Job '%s': koko secretary guard blocked output — skipping delivery",
+                        job_name,
+                    )
+                    final_response = SILENT_MARKER
+                    logged_response = SILENT_MARKER
+            except Exception as _sg_exc:
+                logger.warning(
+                    "Job '%s': secretary_guard check failed (non-fatal, passing): %s",
+                    job_name, _sg_exc,
+                )
+        # ────────────────────────────────────────────────────────────────────
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}

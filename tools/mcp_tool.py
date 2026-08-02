@@ -2203,7 +2203,10 @@ class MCPServerTask:
                 )
 
         # Fallback probe for servers without ping support.
-        await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
+        # [local-patch] 30s -> 90s: slow vault walkers exceed 30s on a cold
+        # list_tools and a timeout here tears down an otherwise-healthy
+        # connection.
+        await asyncio.wait_for(self.session.list_tools(), timeout=90.0)
 
     def _mark_session_proven(self) -> None:
         """Record that the current session demonstrated real health.
@@ -2261,15 +2264,27 @@ class MCPServerTask:
         # a ``list_tools`` keepalive against an 830-tool server would pull
         # ~1 MB every cycle. Tool-list changes still arrive out-of-band via
         # ``notifications/tools/list_changed`` → ``_refresh_tools``.
-        keepalive_interval = max(
-            _MIN_KEEPALIVE_INTERVAL,
-            float(self._config.get("keepalive_interval", _DEFAULT_KEEPALIVE_INTERVAL)),
+        # [local-patch] keepalive_interval <= 0 disables the keepalive
+        # entirely (for servers that hang on any probe): keep the raw,
+        # pre-floor value for that check, since the floor would hide a 0.
+        _raw_keepalive_interval = float(
+            self._config.get("keepalive_interval", _DEFAULT_KEEPALIVE_INTERVAL)
         )
+        keepalive_interval = max(_MIN_KEEPALIVE_INTERVAL, _raw_keepalive_interval)
 
         shutdown_task = asyncio.create_task(self._shutdown_event.wait())
         reconnect_task = asyncio.create_task(self._reconnect_event.wait())
         try:
             while True:
+                # [local-patch] keepalive disabled — wait for a lifecycle
+                # event only, no periodic probe.
+                if _raw_keepalive_interval <= 0:
+                    done, _pending = await asyncio.wait(
+                        {shutdown_task, reconnect_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    break
+
                 recycle_reason = self._stdio_recycle_reason()
                 if recycle_reason is not None:
                     self._mark_stdio_recycled(recycle_reason)
@@ -3615,6 +3630,21 @@ _server_error_counts: Dict[str, int] = {}
 _server_breaker_opened_at: Dict[str, float] = {}
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
+
+# JSON-RPC codes that mean the *request* was malformed (bad params, unknown
+# method / invalid request), i.e. the caller's fault — not a sign the server
+# is unhealthy. These must NOT feed the circuit breaker; otherwise a model
+# repeatedly passing wrong arguments trips a false "server unreachable"
+# cooldown that turns a fixable param typo into a dead session (0127 §4).
+_CLIENT_FAULT_JSONRPC_CODES = frozenset({-32602, -32600, -32601})
+
+
+def _is_client_arg_error(exc: Exception) -> bool:
+    """True if ``exc`` is an MCP error caused by a malformed client request
+    (invalid params / invalid request / method not found). Reflects the
+    caller's arguments, not server health, so it should not bump the breaker."""
+    code = getattr(getattr(exc, "error", None), "code", None)
+    return code in _CLIENT_FAULT_JSONRPC_CODES
 
 
 def _bump_server_error(server_name: str) -> None:
@@ -4979,11 +5009,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
 
-            _bump_server_error(server_name)
-            logger.error(
-                "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, exc,
-            )
+            if _is_client_arg_error(exc):
+                # [local-patch] Malformed arguments from the model — server
+                # is healthy. Surface the error so the model can fix its
+                # params and retry, but don't feed the circuit breaker.
+                logger.warning(
+                    "MCP tool %s/%s client-side arg error (breaker not bumped): %s",
+                    server_name, tool_name, exc,
+                )
+            else:
+                _bump_server_error(server_name)
+                logger.error(
+                    "MCP tool %s/%s call failed: %s",
+                    server_name, tool_name, exc,
+                )
             return tool_error(_sanitize_error(
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
             ))

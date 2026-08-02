@@ -7,6 +7,8 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import os
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -17,6 +19,48 @@ try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+_ENGLISH_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "am", "be", "been",
+    "do", "does", "did", "have", "has", "had", "i", "my", "me", "you",
+    "your", "what", "when", "where", "how", "many", "much", "which",
+    "who", "whose", "why", "currently", "now", "still", "very", "really",
+    "just", "also", "then", "than", "that", "this", "these", "those",
+    "there", "here", "it", "its", "of", "to", "for", "with", "and", "or",
+    "from", "as", "by", "on", "in", "at", "will", "would", "can", "could",
+    "should",
+}
+
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9']+|[一-鿿]+")
+
+
+def _quote_fts_token(token: str) -> str:
+    escaped = token.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """Convert natural-language text into an FTS5 OR query.
+
+    facts_fts is created with SQLite FTS5's default unicode61 tokenizer. It
+    tokenizes contiguous CJK text as one token, so splitting CJK into
+    per-character or bigram terms would not match existing indexed tokens.
+    """
+    original_tokens = _FTS_TOKEN_RE.findall(query)
+    if not original_tokens:
+        return ""
+
+    filtered_tokens = []
+    for token in original_tokens:
+        normalized = token.lower()
+        if len(normalized) == 1:
+            continue
+        if normalized in _ENGLISH_STOPWORDS:
+            continue
+        filtered_tokens.append(normalized)
+
+    tokens = filtered_tokens or [token.lower() for token in original_tokens]
+    return " OR ".join(_quote_fts_token(token) for token in tokens)
 
 
 class FactRetriever:
@@ -62,8 +106,15 @@ class FactRetriever:
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         """
-        # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
-        candidates = self._fts_candidates(query, category, min_trust, limit * 3)
+        # Stage 1a: FTS5 lexical candidates (lexical recall)
+        fts_candidates = self._fts_candidates(query, category, min_trust, limit * 3)
+        # Stage 1b: HRR semantic candidates (catches CJK queries that FTS5 mistokenizes,
+        # never-seen tokens, and multi-token natural-language phrasings)
+        hrr_candidates = (self._hrr_candidates(query, category, min_trust, limit * 3)
+                          if self.hrr_weight > 0 else [])
+        seen_ids = {f["fact_id"] for f in fts_candidates}
+        candidates = fts_candidates + [h for h in hrr_candidates
+                                       if h["fact_id"] not in seen_ids]
 
         if not candidates:
             return []
@@ -508,13 +559,22 @@ class FactRetriever:
 
         # Build query - FTS5 rank is negative (lower = better match)
         # We need to join facts_fts with facts to get all columns
+        fts_query = _sanitize_fts_query(query)
+        if not fts_query:
+            return []
+
         params: list = []
         where_clauses = ["facts_fts MATCH ?"]
         # FTS5 defaults to AND-between-tokens, which kills recall on
         # natural-language queries ("what happened with the deployment
         # rollback"). Sanitize: drop stopwords, OR-join content tokens, so
         # any significant term can match.
-        params.append(self._sanitize_fts_query(query))
+        # [local-patch] use the module-level sanitizer (already computed as
+        # fts_query above): its regex tokenizer keeps contiguous CJK runs as
+        # single tokens, matching FTS5's unicode61 behaviour — upstream's
+        # classmethod splits on whitespace, which never splits Chinese
+        # queries and so degenerates to one giant AND term.
+        params.append(fts_query)
 
         if category:
             where_clauses.append("f.category = ?")
@@ -558,6 +618,64 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    def _hrr_candidates(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Get raw HRR-semantic candidates (Plate 1995 holographic recall).
+
+        Full scan over facts with hrr_vector (cheap at <10k rows). Returns
+        top-N by cosine similarity to query encoding. Bypasses FTS5
+        tokenization so CJK natural-language queries and never-indexed
+        tokens still surface relevant facts.
+        """
+        if not hrr._HAS_NUMPY:
+            return []
+        conn = self.store._conn
+
+        where = ["hrr_vector IS NOT NULL", "trust_score >= ?"]
+        params: list = [min_trust]
+        if category:
+            where.append("category = ?")
+            params.append(category)
+
+        sql = f"""
+            SELECT fact_id, content, category, tags, trust_score,
+                   retrieval_count, helpful_count, created_at, updated_at,
+                   hrr_vector
+            FROM facts
+            WHERE {' AND '.join(where)}
+        """
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except Exception:
+            return []
+
+        if not rows:
+            return []
+
+        query_vec = hrr.encode_text(query, self.hrr_dim)
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            fact = dict(row)
+            try:
+                fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
+            except Exception:
+                continue
+            sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # [0,1]
+            fact["hrr_recall_sim"] = sim
+            fact["fts_rank"] = 0.0  # HRR-only candidate, no lexical signal
+            scored.append((sim, fact))
+
+        # Drop noise: empirical baseline ~0.52 on this 1024-dim space
+        # (any query vs unrelated fact). Real semantic hits land 0.6+.
+        HRR_MIN_SIM = float(os.environ.get("HOLO_HRR_THRESHOLD", "0.55"))
+        scored.sort(key=lambda x: -x[0])
+        return [fact for sim, fact in scored[:limit] if sim >= HRR_MIN_SIM]
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:

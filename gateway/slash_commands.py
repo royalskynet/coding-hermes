@@ -3528,6 +3528,124 @@ class GatewaySlashCommandsMixin:
                      f"~/.hermes/pending/skills/{pending_id}.json)")
         return out
 
+    async def _handle_llm_command(self, event: MessageEvent) -> str:
+        """Handle /llm — show or switch LLM mode (subscription/free).
+
+        ``/llm`` / ``/llm status`` shows the current mode, configured main
+        model, fallback chain, and the actually-effective provider/model
+        (session override or cached agent wins over config).
+        ``/llm sub`` / ``/llm free`` rewrites the ``model`` block in
+        config.yaml, migrates the fallback chain to ``fallback_providers``
+        (reusing the existing entries from config — no hardcoded keys),
+        persists via ``save_config`` and evicts the cached agent so the
+        switch takes effect on the next turn.
+        """
+        from gateway.run import _load_gateway_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        args = event.get_command_args().strip().lower()
+
+        mode_presets = {
+            "sub": {
+                "label": "訂閱模式（codex-proxy gpt-5.4-mini）",
+                "model": {
+                    "default": "gpt-5.4-mini",
+                    "provider": "codex-proxy",
+                    "api_mode": "chat_completions",
+                    "base_url": "http://127.0.0.1:10531/v1",
+                },
+            },
+            "free": {
+                "label": "免費模式（Agnes agnes-2.0-flash）",
+                "model": {
+                    "default": "agnes-2.0-flash",
+                    "provider": "agnes",
+                    "api_mode": "chat_completions",
+                    "base_url": "https://apihub.agnes-ai.com/v1",
+                },
+            },
+        }
+
+        def _chain_lines(chain: list) -> list:
+            if not chain:
+                return ["  （無）"]
+            return [
+                f"  {i}. {e.get('provider', '?')} / {e.get('model', '?')}"
+                for i, e in enumerate(chain, 1)
+            ]
+
+        cfg = _load_gateway_config() or {}
+
+        if not args or args == "status":
+            llm_mode = cfg.get("llm_mode") or "sub (default)"
+            model_cfg = cfg.get("model", {})
+            if isinstance(model_cfg, dict):
+                cfg_model = model_cfg.get("default", "unknown")
+                cfg_provider = model_cfg.get("provider", "unknown")
+            else:
+                cfg_model = str(model_cfg or "unknown")
+                cfg_provider = "unknown"
+            chain = get_fallback_chain(cfg)
+
+            # Effective model: session override, then cached agent, then config
+            session_key = self._session_key_for_source(event.source)
+            actual_model, actual_provider = cfg_model, cfg_provider
+            override = self._session_model_overrides.get(session_key, {})
+            if override:
+                actual_model = override.get("model", actual_model)
+                actual_provider = override.get("provider", actual_provider)
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            if _cache_lock is not None:
+                with _cache_lock:
+                    _cached = self._agent_cache.get(session_key)
+                _agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
+                if _agent is not None:
+                    actual_model = getattr(_agent, "model", None) or actual_model
+                    actual_provider = getattr(_agent, "provider", None) or actual_provider
+
+            lines = [
+                f"LLM 模式：{llm_mode}",
+                f"主模型（config）：{cfg_provider} / {cfg_model}",
+                f"目前生效：{actual_provider} / {actual_model}",
+                "Fallback 鏈：",
+                *_chain_lines(chain),
+            ]
+            return "\n".join(lines)
+
+        if args in ("free", "sub"):
+            preset = mode_presets[args]
+            # Reuse the existing chain from raw config (keeps api_key /
+            # env-var templates as-is; nothing hardcoded here).
+            chain = get_fallback_chain(cfg)
+            try:
+                cfg["model"] = dict(preset["model"])
+                if chain:
+                    cfg["fallback_providers"] = [dict(e) for e in chain]
+                cfg.pop("fallback_model", None)
+                cfg["llm_mode"] = args
+                from hermes_cli.config import save_config
+                save_config(cfg)
+            except Exception as e:
+                logger.error("Failed to switch LLM mode to %s: %s", args, e)
+                return f"切換失敗：{e}"
+
+            # Invalidate session override + cached agent so the new mode
+            # takes effect on the next turn.
+            session_key = self._session_key_for_source(event.source)
+            self._session_model_overrides.pop(session_key, None)
+            self._evict_cached_agent(session_key)
+
+            lines = [f"已切換至 {preset['label']}", "Fallback 鏈："]
+            lines.extend(_chain_lines(chain))
+            return "\n".join(lines)
+
+        return (
+            "用法：/llm [status|free|sub]\n"
+            "  status — 顯示目前模式、主模型與 fallback 鏈\n"
+            "  free — 切免費模式（Agnes agnes-2.0-flash）\n"
+            "  sub — 切訂閱模式（codex-proxy gpt-5.4-mini）"
+        )
+
     async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats.
 

@@ -2598,12 +2598,21 @@ def terminal_tool(
                     f"Command denied: {desc}. "
                     "Use the approval prompt to allow it, or rephrase the command."
                 )
-                return json.dumps({
+                # [local-patch] A3: surface the approval outcome (e.g. "timeout"
+                # vs "denied") in the tool result so callers can distinguish an
+                # approval that never got a response from one the user actively
+                # rejected, without re-parsing the free-text error message. See
+                # fixindex 0033-approval-timeout-iteration-budget.
+                result_payload = {
                     "output": "",
                     "exit_code": -1,
                     "error": approval.get("message", fallback_msg),
-                    "status": "blocked"
-                }, ensure_ascii=False)
+                    "status": "blocked",
+                }
+                _approval_outcome = approval.get("outcome")
+                if _approval_outcome:
+                    result_payload["approval_outcome"] = _approval_outcome
+                return json.dumps(result_payload, ensure_ascii=False)
             # Track whether approval was explicitly granted by the user
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")

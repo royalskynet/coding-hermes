@@ -14819,6 +14819,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
         # Check for commands
+        # === PATCH: bare command normalization (realcmd 20260729) ===
+        if not event.text.startswith("/"):
+            try:
+                _tg_cfg = (self.config.get("telegram") if isinstance(self.config, dict)
+                           else getattr(self.config, "telegram", None))
+                _bare = (_tg_cfg or {}).get("bare_command_prefixes") or [] if _tg_cfg else []
+            except Exception:
+                _bare = []
+            if _bare:
+                _parts = event.text.strip().split(maxsplit=1)
+                _head = _parts[0].lower() if _parts else ""
+                if _head in {str(x).lower() for x in _bare} and len(_parts) > 1:
+                    logger.info("Bare command normalized: %r -> /%s", event.text.strip(), _head)
+                    event.text = "/" + event.text.strip()
         command = event.get_command()
 
         from hermes_cli.commands import (
@@ -15045,6 +15059,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
+
+        if canonical == "llm":
+            return await self._handle_llm_command(event)
 
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
@@ -15449,8 +15466,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         else:
                             return f"Failed to load stacked skills for /{command}."
                     else:
+                        _info = skill_cmds.get(cmd_key, {})
+                        _mode = _info.get("alias_mode")
+                        _note = (
+                            f"Invoked as /{_mode}. Execute the {_mode.upper()} "
+                            f"flow defined in this SKILL.md." if _mode else ""
+                        )
                         msg = build_skill_invocation_message(
-                            cmd_key, user_instruction, task_id=_quick_key
+                            cmd_key, user_instruction, task_id=_quick_key,
+                            runtime_note=(_note or None),
                         )
                         if msg:
                             event.text = msg
@@ -15567,6 +15591,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
+                        # [local-patch] A2-c: OR-branch before the existing
+                        # goal hook. If this turn stopped on max_iterations
+                        # and no goal loop is running, arm a system-owned
+                        # goal first so the call below has something active
+                        # to continue — previously the turn just ended here
+                        # with the task unfinished and auto.continue never
+                        # fired. See fixindex 0032-max-iterations-no-continuation.
+                        try:
+                            self._maybe_arm_auto_goal_after_max_iterations(
+                                session_entry=session_entry,
+                                source=source,
+                                event=event,
+                            )
+                        except Exception as _auto_goal_exc:
+                            logger.debug("auto-goal arming failed: %s", _auto_goal_exc)
                         await self._post_turn_goal_continuation(
                             session_entry=session_entry,
                             source=source,
@@ -18686,7 +18725,124 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
+    # ── [local-patch] A2: auto-continuation after an iteration-limit stop ──
+    # See fixindex 0032-max-iterations-no-continuation.
 
+    def _session_agent_for_key(self, session_key: str):
+        """Return the AIAgent that served this session, or None.
+
+        Mirrors the running-then-cached lookup in ``_handle_usage_command``:
+        mid-turn the agent lives in ``_running_agents``, between turns in
+        ``_agent_cache``. The turn-boundary hook runs after the agent has
+        been released, so the cache is normally the hit.
+        """
+        agent = self._running_agents.get(session_key)
+        if agent and agent is not _AGENT_PENDING_SENTINEL:
+            return agent
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock is not None and _cache is not None:
+            with _cache_lock:
+                cached = _cache.get(session_key)
+            if cached:
+                return cached[0] if isinstance(cached, tuple) else cached
+        return None
+
+    def _first_user_text_for_session(self, session_id: str) -> str:
+        """First user message of a session, used as auto-goal text when the
+        triggering event carried no usable text (media-only message, etc.)."""
+        try:
+            from hermes_state import SessionDB
+
+            for msg in SessionDB().get_messages(session_id) or []:
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, list):
+                    content = "\n".join(
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") in {"text", "output_text"}
+                    )
+                text = str(content or "").strip()
+                if text:
+                    return text
+        except Exception as exc:
+            logger.debug("auto-goal: first user message lookup failed: %s", exc)
+        return ""
+
+    def _maybe_arm_auto_goal_after_max_iterations(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        event: "MessageEvent",
+    ) -> None:
+        """Arm a system-owned goal when the turn died on max_iterations and
+        no goal loop is running, so ``_post_turn_goal_continuation`` (called
+        right after this) picks the work back up instead of leaving the task
+        half-done.
+
+        This adds no continuation machinery of its own — it only creates the
+        GoalState that the existing loop already knows how to drive, which is
+        what supplies the stop conditions (turn budget, judge verdict,
+        pause/resume).
+        """
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("auto-goal: goals module unavailable: %s", exc)
+            return
+
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception as exc:
+            logger.debug("auto-goal: session key lookup failed: %s", exc)
+            return
+
+        agent = self._session_agent_for_key(session_key)
+        hit = bool(getattr(agent, "_last_turn_hit_max_iterations", False)) if agent else False
+
+        mgr = GoalManager(
+            session_id=sid,
+            default_max_turns=self._goal_max_turns_from_config(),
+        )
+        # Record the flag even for an already-running user-set goal: its next
+        # continuation prompt also has to cancel the "stop calling tools"
+        # message handle_max_iterations left in the transcript.
+        mgr.note_max_iterations(hit)
+
+        if not hit or mgr.is_active():
+            return
+
+        goal_text = (getattr(event, "text", "") or "").strip()
+        if not goal_text:
+            goal_text = self._first_user_text_for_session(sid)
+
+        state = mgr.ensure_auto_goal(goal_text)
+        if state is None:
+            logger.info(
+                "auto.continue: max_iterations stop on session=%s but no auto goal armed "
+                "(empty goal text, or an existing paused/active goal blocks re-arming)",
+                sid,
+            )
+            return
+
+        logger.info(
+            "auto.continue: armed auto goal after max_iterations stop — "
+            "session=%s budget=%d goal=%r",
+            sid, state.max_turns, state.goal[:120],
+        )
+        # Clear the flag so a later turn in this session can't re-arm off a
+        # stale value if the agent instance is reused without a new turn.
+        try:
+            if agent is not None:
+                agent._last_turn_hit_max_iterations = False
+        except Exception:
+            pass
 
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:

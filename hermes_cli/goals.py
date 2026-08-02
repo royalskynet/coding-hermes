@@ -72,6 +72,34 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
+# [local-patch] A2: cap for auto-generated goal text. The goal string is
+# echoed into every continuation prompt and every judge call, so a pasted
+# 50KB user message must not become a permanent per-turn tax.
+# See fixindex 0032-max-iterations-no-continuation.
+AUTO_GOAL_MAX_CHARS = 1200
+
+# [local-patch] A2: prefix prepended to the continuation prompt when the
+# turn that just ended hit the iteration ceiling.
+#
+# Why this exists: ``agent/chat_completion_helpers.py:handle_max_iterations``
+# appends a real ``user`` message to the transcript saying "provide a final
+# response ... without calling any more tools". That message becomes part of
+# the permanent conversation history. Without an explicit override the very
+# next turn re-reads it as a standing instruction, refuses to call tools,
+# and the continuation burns a turn re-summarising instead of working —
+# i.e. the auto-continuation would be a no-op.
+# See fixindex 0032-max-iterations-no-continuation.
+MAX_ITERATIONS_OVERRIDE_PREAMBLE = (
+    "[Automatic continuation after hitting the tool-iteration limit]\n"
+    "The previous turn stopped because it ran out of tool iterations — NOT "
+    "because the work was finished. That turn was asked to stop calling "
+    "tools and summarise; **that instruction applied only to that turn and "
+    "is now cancelled**.\n"
+    "You have a fresh iteration budget. You SHOULD call tools again now to "
+    "make real progress. Do not reply with another summary of what you "
+    "already did — continue the actual work.\n\n"
+)
+
 
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
@@ -442,6 +470,19 @@ class GoalState:
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
     contract: GoalContract = field(default_factory=GoalContract)
+    # [local-patch] A2: True when Hermes created this goal itself after a
+    # turn hit the iteration ceiling, rather than the user running
+    # ``/goal <text>``. Surfaced in status_line() so the two are
+    # distinguishable, and used to gate auto-goal re-arming.
+    # See fixindex 0032-max-iterations-no-continuation.
+    auto_created: bool = False
+    # [local-patch] A2: set by the turn-boundary hook when the turn that
+    # just ended exited via max_iterations. Drives the
+    # MAX_ITERATIONS_OVERRIDE_PREAMBLE on the next continuation prompt so
+    # the "stop calling tools" message injected by handle_max_iterations is
+    # explicitly cancelled. Applies to user-set goals too, not just auto
+    # ones. See fixindex 0032-max-iterations-no-continuation.
+    last_turn_hit_max_iterations: bool = False
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -474,6 +515,13 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
             contract=GoalContract.from_dict(data.get("contract")),
+            # [local-patch] A2 — default False keeps pre-existing state_meta
+            # rows (written before this patch) loading unchanged.
+            # See fixindex 0032-max-iterations-no-continuation.
+            auto_created=bool(data.get("auto_created", False)),
+            last_turn_hit_max_iterations=bool(
+                data.get("last_turn_hit_max_iterations", False)
+            ),
         )
 
     # --- contract helpers -------------------------------------------------
@@ -1120,7 +1168,12 @@ class GoalManager:
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
-        meta = f"{turns}{sub}{con}"
+        # [local-patch] A2: mark goals Hermes set for itself after an
+        # iteration-limit stop, so /goal status doesn't look like the user
+        # set something they never typed.
+        # See fixindex 0032-max-iterations-no-continuation.
+        auto = ", auto" if s.auto_created else ""
+        meta = f"{turns}{sub}{con}{auto}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 wr = s.waiting_reason or f"session {s.waiting_on_session}"
@@ -1169,6 +1222,91 @@ class GoalManager:
         self._state.contract = contract or GoalContract()
         save_goal(self.session_id, self._state)
         return self._state
+
+    # --- [local-patch] A2: automatic goal after an iteration-limit stop ---
+    # See fixindex 0032-max-iterations-no-continuation.
+
+    def note_max_iterations(self, hit: bool = True) -> None:
+        """Record whether the turn that just ended hit the iteration ceiling.
+
+        Drives ``MAX_ITERATIONS_OVERRIDE_PREAMBLE`` on the next continuation
+        prompt. Applies to user-set goals as well as auto-created ones: any
+        goal loop whose turn dies on max_iterations inherits the "stop
+        calling tools" message that ``handle_max_iterations`` appended to the
+        transcript, and needs it cancelled.
+
+        No-op when no goal state exists.
+        """
+        if self._state is None:
+            return
+        if bool(self._state.last_turn_hit_max_iterations) == bool(hit):
+            return
+        self._state.last_turn_hit_max_iterations = bool(hit)
+        save_goal(self.session_id, self._state)
+
+    def can_auto_create(self) -> bool:
+        """Whether an auto goal may be armed right now.
+
+        Deliberately narrow — this is the guard that keeps auto-continuation
+        from becoming an infinite self-feeding loop:
+
+        - no state at all            → yes (nothing to override)
+        - status done / cleared      → yes (previous objective finished; a
+                                      later iteration-limit stop is new work)
+        - status active              → no (a loop is already running)
+        - status paused              → **no**. This is the stop condition.
+          ``evaluate_after_turn`` pauses on budget exhaustion and on repeated
+          judge parse failures, and the user pauses explicitly. Re-arming
+          here would resurrect exactly the loop those guards just stopped.
+        """
+        if self._state is None:
+            return True
+        return self._state.status in {"done", "cleared"}
+
+    def ensure_auto_goal(
+        self,
+        goal_text: str,
+        *,
+        max_turns: Optional[int] = None,
+    ) -> Optional[GoalState]:
+        """Create a system-owned goal so the existing continuation loop can
+        take over after a turn stopped on ``max_iterations``.
+
+        Returns the new ``GoalState``, or ``None`` when nothing was created
+        (empty text, or ``can_auto_create()`` said no).
+
+        Nothing new is invented here: the state this writes is the same
+        ``GoalState`` ``/goal <text>`` produces, so the turn budget, judge,
+        pause/resume and stop conditions are all the pre-existing ones. The
+        only differences are ``auto_created=True`` (for ``/goal status``) and
+        the truncation of the goal text.
+        """
+        text = (goal_text or "").strip()
+        if not text:
+            return None
+        if not self.can_auto_create():
+            return None
+        if len(text) > AUTO_GOAL_MAX_CHARS:
+            text = text[:AUTO_GOAL_MAX_CHARS].rstrip() + "… [truncated]"
+
+        budget = int(max_turns) if max_turns else self.default_max_turns
+        state = GoalState(
+            goal=text,
+            status="active",
+            turns_used=0,
+            max_turns=budget,
+            created_at=time.time(),
+            last_turn_at=0.0,
+            auto_created=True,
+            last_turn_hit_max_iterations=True,
+        )
+        self._state = state
+        save_goal(self.session_id, state)
+        logger.info(
+            "goal auto-created after max_iterations stop: session=%s budget=%d goal=%r",
+            self.session_id, budget, _truncate(text, 120),
+        )
+        return state
 
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         if not self._state:
@@ -1610,16 +1748,25 @@ class GoalManager:
                     for i, text in enumerate(self._state.subgoals, start=1)
                 )
                 contract_block = f"{contract_block}\n{extra}"
-            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
                 goal=self._state.goal,
                 contract_block=contract_block,
             )
-        if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+        elif self._state.subgoals:
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        # [local-patch] A2: cancel the "stop calling tools" user message that
+        # handle_max_iterations left in the transcript. Without this the
+        # model reads it as still in force and the continuation turn just
+        # re-summarises — a silent no-op continuation.
+        # See fixindex 0032-max-iterations-no-continuation.
+        if self._state.last_turn_hit_max_iterations:
+            prompt = MAX_ITERATIONS_OVERRIDE_PREAMBLE + prompt
+        return prompt
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
@@ -1791,6 +1938,9 @@ __all__ = [
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
+    # [local-patch] A2 — see fixindex 0032-max-iterations-no-continuation.
+    "MAX_ITERATIONS_OVERRIDE_PREAMBLE",
+    "AUTO_GOAL_MAX_CHARS",
     "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",

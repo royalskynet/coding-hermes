@@ -1266,6 +1266,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
+        # ── Empty path guard ──────────────────────────────────────────
+        # An empty or whitespace-only path produces misleading
+        # "similar_files" noise (dirname("") → "." → lists cwd entries).
+        if not path or not path.strip():
+            return json.dumps({
+                "error": "path is required and cannot be empty",
+            })
+
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
@@ -1484,6 +1492,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     "offset."
                 )
             content_len = len(trimmed)
+            # [local-patch] B4-b: alongside upstream's byte-oriented
+            # `next_offset`, surface how many LINES actually fit the budget.
+            # next_offset says where to resume; suggested_limit is the number
+            # the model needs to pick a working `limit` on a re-read. The
+            # pre-truncation error path had only "use offset and limit" with
+            # no number at all — that vagueness is what B4-b set out to fix.
+            result_dict["suggested_limit"] = max(1, lines_kept)
+            result_dict["hint"] += (
+                f" A limit of about {max(1, lines_kept)} line(s) fits the budget."
+            )
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:

@@ -224,6 +224,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status] [--global]",
                subcommands=("normal", "fast", "status", "on", "off", "--global")),
+    CommandDef("llm", "Show or switch LLM mode (subscription/free)", "Configuration",
+               args_hint="[status|free|sub]",
+               subcommands=("status", "free", "sub"),
+               gateway_only=True),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -639,6 +643,7 @@ _TELEGRAM_MENU_PRIORITY = (
     "resume",
     "sessions",
     "model",
+    "llm",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
     "restart",

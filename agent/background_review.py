@@ -900,11 +900,22 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            # The fork advertises the PARENT's full tools[] (see the
+            # cache-key note above), so the model sees dozens of tools it
+            # may not actually call.  Naming the four that work — in both
+            # the prompt and the denial — lets it correct in one step.
+            # Without this it burned 1-6 LLM round-trips per review probing
+            # read_file / execute_code / search_files / session_search one
+            # at a time, each a full request against the gateway.
+            _allowed = ", ".join(sorted(review_whitelist))
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
                     "Background review denied non-whitelisted tool: "
-                    "{tool_name}. Only memory/skill tools are allowed."
+                    "{tool_name}. The only callable tools in this review are: "
+                    + _allowed
+                    + ". Continue using those, or answer directly from the "
+                    "conversation history you were given."
                 ),
             )
             try:
@@ -925,9 +936,12 @@ def _run_review_in_thread(
                 review_agent.run_conversation(
                     user_message=(
                         prompt
-                        + "\n\nYou can only call memory and skill "
-                        "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
+                        + "\n\nTool access in this review is limited to "
+                        "exactly these: "
+                        + _allowed
+                        + ". Everything you need to review is already in the "
+                        "conversation history above — read it from there "
+                        "rather than looking files up."
                     ),
                     conversation_history=_review_history,
                 )

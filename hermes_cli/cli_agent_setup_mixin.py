@@ -29,7 +29,7 @@ class CLIAgentSetupMixin:
         are picked up without restarting the CLI.
         Returns True if credentials are ready, False on auth failure.
         """
-        from cli import ChatConsole, _cprint, logger
+        from cli import ChatConsole, _cnotice, _cprint, logger
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
@@ -70,7 +70,9 @@ class CLIAgentSetupMixin:
                             "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,
                         )
-                        _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
+                        # [local-patch] stderr, not stdout — subprocess
+                        # consumers capture stdout as the agent reply body.
+                        _cnotice(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
                         _primary_exc = None

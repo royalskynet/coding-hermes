@@ -2330,6 +2330,11 @@ class CLICommandsMixin:
                 _cprint(f"  {_DIM}No goal set.{_RST}")
             else:
                 _cprint(f"  ⏸ Goal paused: {state.goal}")
+                # [local-patch] goal state changed — force system prompt
+                # rebuild so the volatile-tier goal block (agent/system_prompt.py)
+                # reflects the new status next turn. See fixindex 0031-goal-lost-on-compression.
+                if hasattr(self.agent, "_invalidate_system_prompt"):
+                    self.agent._invalidate_system_prompt()
             return
 
         if lower == "resume":
@@ -2342,6 +2347,9 @@ class CLICommandsMixin:
                     f"  {_DIM}Send any message (or press Enter on an empty prompt "
                     f"is a no-op; type 'continue' to kick it off).{_RST}"
                 )
+                # [local-patch] see pause() above.
+                if hasattr(self.agent, "_invalidate_system_prompt"):
+                    self.agent._invalidate_system_prompt()
             return
 
         if lower in {"clear", "stop", "done"}:
@@ -2349,6 +2357,9 @@ class CLICommandsMixin:
             mgr.clear()
             if had:
                 _cprint("  ✓ Goal cleared.")
+                # [local-patch] see pause() above.
+                if hasattr(self.agent, "_invalidate_system_prompt"):
+                    self.agent._invalidate_system_prompt()
             else:
                 _cprint(f"  {_DIM}No active goal.{_RST}")
             return
@@ -2399,6 +2410,10 @@ class CLICommandsMixin:
             _cprint(f"  Invalid goal: {exc}")
             return
 
+        # [local-patch] see pause() above.
+        if hasattr(self.agent, "_invalidate_system_prompt"):
+            self.agent._invalidate_system_prompt()
+
         _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
         if state.has_contract():
             _cprint(f"  {_DIM}Completion contract:{_RST}")
@@ -2442,6 +2457,10 @@ class CLICommandsMixin:
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
+
+        # [local-patch] see pause() above.
+        if hasattr(self.agent, "_invalidate_system_prompt"):
+            self.agent._invalidate_system_prompt()
 
         _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
         if state.has_contract():

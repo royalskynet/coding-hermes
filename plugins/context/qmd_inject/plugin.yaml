@@ -1,0 +1,6 @@
+name: qmd_inject
+version: "1.0.0"
+description: "Koko-only qmd vault retrieval injection via pre_llm_call."
+author: local
+hooks:
+  - pre_llm_call

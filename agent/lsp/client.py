@@ -978,6 +978,108 @@ class LSPClient:
             )
         return _dedupe(doc.push, doc.pull)
 
+    # ------------------------------------------------------------------
+    # [local-patch] LSP symbol tools — see fixindex 0030-lsp-symbol-tools-local-patch-reapply.
+    # Re-apply after hermes upgrade.
+    # ------------------------------------------------------------------
+
+    async def definition(
+        self, path: str, line: int, character: int
+    ) -> List[Dict[str, Any]]:
+        """Resolve the definition at ``(line, character)`` in ``path``.
+
+        ``path`` **must** have been opened via :meth:`open_file` first.
+
+        The LSP response can be ``Location``, ``Location[]``, or
+        ``LocationLink[]``.  We normalize all three to a unified list of
+        ``{file, uri, range, selectionRange}`` dicts.
+        """
+        uri = file_uri(os.path.abspath(path))
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+        }
+        result = await self._send_request("textDocument/definition", params)
+        return _normalise_locations(result)
+
+    async def references(
+        self,
+        path: str,
+        line: int,
+        character: int,
+        *,
+        include_declaration: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Find all references to the symbol at ``(line, character)`` in ``path``.
+
+        ``path`` must already be open via :meth:`open_file`.
+        """
+        uri = file_uri(os.path.abspath(path))
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+            "context": {"includeDeclaration": include_declaration},
+        }
+        result = await self._send_request("textDocument/references", params)
+        return _normalise_locations(result)
+
+    async def document_symbols(self, path: str) -> List[Dict[str, Any]]:
+        """Return the symbol tree (``DocumentSymbol[]``) for ``path``.
+
+        Falls back to flat ``SymbolInformation[]`` if the server
+        didn't honor our ``hierarchicalDocumentSymbolSupport`` declare.
+        """
+        uri = file_uri(os.path.abspath(path))
+        result = await self._send_request("textDocument/documentSymbol", {
+            "textDocument": {"uri": uri},
+        })
+        if isinstance(result, list) and result and isinstance(result[0], dict):
+            return result
+        return _normalise_locations(result) if result else []
+
+    async def workspace_symbols(self, query: str) -> List[Dict[str, Any]]:
+        """Search the whole workspace for symbols matching ``query``."""
+        result = await self._send_request("workspace/symbol", {"query": query})
+        return _normalise_locations(result) if result else []
+
+    async def _send_request_with_soft_degrade(self, method: str, params: Any, *, timeout: float) -> Any:
+        """Send a request; return a dict with ``error`` if ``MethodNotFound``.
+
+        Does NOT raise on ``MethodNotFound`` — callers gracefully degrade
+        for servers that don't implement every method.
+        """
+        try:
+            return await asyncio.wait_for(self._send_request(method, params), timeout=timeout)
+        except LSPRequestError as e:
+            if e.code == ERROR_METHOD_NOT_FOUND:
+                return {"_lsp_error": "MethodNotFound", "method": method, "message": str(e)}
+            raise
+
+
+def _normalise_locations(
+    raw: Any,
+) -> List[Dict[str, Any]]:
+    """Normalize the three Location forms into a flat stable list."""
+    if raw is None:
+        return []
+    items: list = raw if isinstance(raw, list) else [raw]
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # LocationLink carries targetUri / targetRange; harvest.
+        target_uri = item.get("targetUri") or item.get("uri")
+        target_range = item.get("targetRange") or item.get("range")
+        out_item = {
+            "file": uri_to_path(target_uri) if target_uri else "",
+            "uri": target_uri,
+            "range": target_range,
+        }
+        if "targetSelectionRange" in item:
+            out_item["selectionRange"] = item["targetSelectionRange"]
+        out.append(out_item)
+    return out
+
 
 def _dedupe(*lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: Set[str] = set()

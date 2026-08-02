@@ -142,6 +142,14 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
+        # [local-patch] A2-a: _turn_exit_reason is returned in the result
+        # dict, but the gateway's _handle_message_with_agent collapses that
+        # dict to a bare response string before the turn-boundary hook runs,
+        # so the hook cannot see it. Set the flag on the agent instance
+        # instead; conversation_loop resets it at the start of every turn.
+        # Read by _maybe_arm_auto_goal_after_max_iterations in gateway/run.py.
+        # See fixindex 0032-max-iterations-no-continuation.
+        agent._last_turn_hit_max_iterations = True
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback

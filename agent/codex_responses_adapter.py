@@ -57,6 +57,56 @@ def _classify_responses_issuer(
 _CROSS_ISSUER_WARN_EMITTED = False
 
 
+def _patch_openai_parse_response_none_output() -> None:
+    """Guard openai SDK parse_response against ``response.output is None``.
+
+    ChatGPT codex backend (https://chatgpt.com/backend-api/codex) can
+    return a terminal SSE event whose ``response.output`` (and per-output
+    ``content``) is ``None`` instead of an empty list.  The openai SDK
+    iterates them unconditionally
+    (``openai/lib/_parsing/_responses.py:61``) and raises
+    ``TypeError: 'NoneType' object is not iterable``, killing the stream
+    before Hermes can backfill.  Patch the SDK at import time to coerce
+    ``None`` to ``[]`` in-place before the original logic runs, restoring
+    the documented contract.  Hermes' ``_normalize_codex_response`` then
+    handles empty output via its existing output_text fallback path.
+    """
+    try:
+        from openai.lib._parsing import _responses as _sdk_parsing
+    except Exception:
+        return
+    if getattr(_sdk_parsing, "_hermes_none_output_guarded", False):
+        return
+    _orig = _sdk_parsing.parse_response
+
+    def _parse_response_guarded(*args, **kwargs):
+        response = kwargs.get("response")
+        if response is None and args:
+            response = args[-1]
+        if response is not None:
+            if getattr(response, "output", None) is None:
+                try:
+                    response.output = []
+                except Exception:
+                    pass
+            outs = getattr(response, "output", None)
+            if isinstance(outs, list):
+                for _o in outs:
+                    if getattr(_o, "content", None) is None:
+                        try:
+                            _o.content = []
+                        except Exception:
+                            pass
+        return _orig(*args, **kwargs)
+
+    _sdk_parsing.parse_response = _parse_response_guarded
+    _sdk_parsing._hermes_none_output_guarded = True
+    logger.debug("Patched openai SDK parse_response to tolerate None output/content.")
+
+
+_patch_openai_parse_response_none_output()
+
+
 # Matches Codex/Harmony tool-call serialization that occasionally leaks into
 # assistant-message content when the model fails to emit a structured
 # ``function_call`` item.  Accepts the common forms:

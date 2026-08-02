@@ -51,6 +51,7 @@ import functools
 import hashlib
 import inspect
 import json
+import asyncio
 import logging
 import os
 import re
@@ -3812,6 +3813,51 @@ def _is_timeout_error(exc: Exception) -> bool:
     if "Timeout" in type(exc).__name__:
         return True
     return "timed out" in str(exc).lower()
+
+
+# How many times to wait out a gateway admission-busy 503 before giving up
+# and letting the normal error path run.  Each wait is the server's
+# Retry-After (typically 1s), so this is cheap.
+_ADMISSION_MAX_RETRIES = 3
+
+
+def _is_admission_busy_error(exc: Exception) -> bool:
+    """Detect a gateway admission-control 503 (queue full, not endpoint down).
+
+    OmniRoute rejects a "structurally heavy" chat request with 503
+    ``chat_admission_busy`` when more than ``OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT``
+    heavy requests are in flight.  It is a queue-depth signal, not a broken
+    endpoint: the response carries ``Retry-After`` and the very same request
+    succeeds a second later.
+
+    This must NOT be routed into the fallback chain — every fallback entry
+    would hit the same gateway and get the same 503.  Callers back off and
+    retry the original endpoint instead.  See ``_admission_retry_after``.
+    """
+    if getattr(exc, "status_code", None) not in (503, None):
+        return False
+    err_lower = str(exc).lower()
+    return (
+        "chat_admission_busy" in err_lower
+        or "structurally heavy chat request capacity" in err_lower
+        or "chat admission capacity is temporarily unavailable" in err_lower
+    )
+
+
+def _admission_retry_after(exc: Exception, default: float = 1.0) -> float:
+    """Seconds to wait before retrying an admission-busy rejection.
+
+    Prefers the server's ``Retry-After`` header; clamped to 30s so a
+    misbehaving gateway cannot stall the agent indefinitely.
+    """
+    try:
+        response = getattr(exc, "response", None)
+        raw = response.headers.get("Retry-After") if response is not None else None
+        if raw:
+            return max(0.0, min(30.0, float(str(raw).strip())))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return default
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -8758,6 +8804,26 @@ def call_llm(
                 first_err = retry_err
                 kwargs = retry_kwargs
 
+        # ── Admission-busy backoff ───────────────────────────────────
+        # A 503 chat_admission_busy means the gateway queue is full, not
+        # that the endpoint is broken.  Falling back is useless here (every
+        # fallback entry points at the same gateway), so wait out the
+        # server's Retry-After and re-issue the identical request.
+        for _admission_attempt in range(_ADMISSION_MAX_RETRIES):
+            if not _is_admission_busy_error(first_err):
+                break
+            wait_s = _admission_retry_after(first_err)
+            logger.warning(
+                "Auxiliary %s: gateway admission busy, retrying in %.1fs (%d/%d)",
+                task or "call", wait_s, _admission_attempt + 1, _ADMISSION_MAX_RETRIES,
+            )
+            time.sleep(wait_s)
+            try:
+                return _validate_llm_response(
+                    client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                first_err = retry_err
+
         err_str = str(first_err)
         # ZAI vision models (glm-4v-flash etc.) return error code 1210
         # ("API 调用参数有误") when max_tokens is passed on multimodal
@@ -9401,6 +9467,25 @@ async def async_call_llm(
                     raise
                 first_err = retry_err
                 kwargs = retry_kwargs
+
+        # ── Admission-busy backoff ───────────────────────────────────
+        # See the sync path for the rationale: 503 chat_admission_busy is a
+        # queue-depth signal, so back off and re-issue rather than fall back
+        # to entries that share the same gateway.
+        for _admission_attempt in range(_ADMISSION_MAX_RETRIES):
+            if not _is_admission_busy_error(first_err):
+                break
+            wait_s = _admission_retry_after(first_err)
+            logger.warning(
+                "Auxiliary %s: gateway admission busy, retrying in %.1fs (%d/%d)",
+                task or "call", wait_s, _admission_attempt + 1, _ADMISSION_MAX_RETRIES,
+            )
+            await asyncio.sleep(wait_s)
+            try:
+                return _validate_llm_response(
+                    await client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                first_err = retry_err
 
         err_str = str(first_err)
         # ZAI vision models (glm-4v-flash etc.) return error code 1210

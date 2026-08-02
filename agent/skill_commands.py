@@ -460,6 +460,27 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
                     }
+                    # === PATCH: Register aliases from metadata.hermes.commands (realcmd 20260729) ===
+                    try:
+                        _aliases = (frontmatter.get('metadata') or {}).get('hermes', {}).get('commands') or {}
+                        if isinstance(_aliases, dict):
+                            for _alias, _desc in _aliases.items():
+                                _slug = _SKILL_MULTI_HYPHEN.sub(
+                                    '-', _SKILL_INVALID_CHARS.sub(
+                                        '', str(_alias).lower().replace(' ', '-').replace('_', '-'))
+                                ).strip('-')
+                                if not _slug or f"/{_slug}" in _skill_commands:
+                                    continue
+                                _skill_commands[f"/{_slug}"] = {
+                                    "name": name,
+                                    "description": str(_desc) or f"Invoke the {name} skill",
+                                    "skill_md_path": str(skill_md),
+                                    "skill_dir": str(skill_md.parent),
+                                    "alias_of": cmd_name,
+                                    "alias_mode": _slug,
+                                }
+                    except Exception:
+                        pass
                 except Exception:
                     continue
     except Exception:

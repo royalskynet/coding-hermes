@@ -45,6 +45,7 @@ from agent.lsp import eventlog
 from agent.lsp.client import (
     DIAGNOSTICS_DOCUMENT_WAIT,
     LSPClient,
+    ERROR_METHOD_NOT_FOUND,
 )
 from agent.lsp.servers import (
     ServerContext,
@@ -462,6 +463,109 @@ class LSPService:
         if not already_broken:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
 
+    # ------------------------------------------------------------------
+    # [local-patch] LSP symbol tools — see fixindex 0030-lsp-symbol-tools-local-patch-reapply.
+    # Re-apply after hermes upgrade.
+    # ------------------------------------------------------------------
+
+    def definition_sync(
+        self,
+        path: str,
+        line: int,
+        character: int,
+        *,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return definition locations for the symbol at ``(line, character)`` in ``path``.
+
+        Enforces open_file → definition sequencing.
+        Returns ``[]`` when LSP is disabled, no workspace, no server match,
+        or the server doesn't support ``textDocument/definition``.
+        """
+        if not self.enabled_for(path):
+            return []
+        t = timeout if timeout is not None else self._wait_timeout + 2.0
+        try:
+            return self._loop.run(
+                self._async_definition(path, line, character, timeout=t), timeout=t
+            ) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP definition failed for %s: %s", path, e)
+            return []
+
+    def references_sync(
+        self,
+        path: str,
+        line: int,
+        character: int,
+        *,
+        include_declaration: bool = False,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return all references to the symbol at ``(line, character)`` in ``path``.
+
+        Returns ``[]`` when LSP is disabled or the server doesn't support
+        ``textDocument/references``.
+        """
+        if not self.enabled_for(path):
+            return []
+        t = timeout if timeout is not None else self._wait_timeout + 2.0
+        try:
+            return self._loop.run(
+                self._async_references(path, line, character, include_declaration, timeout),
+                timeout=t,
+            ) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("references failed for %s: %s", path, e)
+            return []
+
+    def document_symbols_sync(
+        self,
+        path: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the symbol tree for ``path``.
+
+        Uses ``open_file`` under the hood — the file must exist and be readable.
+        """
+        if not self.enabled_for(path):
+            return []
+        t = timeout if timeout is not None else self._wait_timeout + 2.0
+        try:
+            return self._loop.run(
+                self._async_document_symbols(path, timeout), timeout=t
+            ) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("document_symbols failed for %s: %s", path, e)
+            return []
+
+    def workspace_symbols_sync(
+        self,
+        query: str,
+        *,
+        anchor_path: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search the whole workspace for symbols matching ``query``.
+
+        ``anchor_path`` picks which LSP server/workspace to query — falls
+        back to cwd when omitted.  Only files already tracked by the LSP
+        (opened at least once) participate; lazy spawn may gate on the
+        anchor.
+        """
+        anchor = anchor_path or os.getcwd()
+        if not self.enabled_for(anchor):
+            return []
+        t = timeout if timeout is not None else self._wait_timeout + 2.0
+        try:
+            return self._loop.run(
+                self._async_workspace_symbols(query, anchor, timeout), timeout=t
+            ) or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("workspace_symbols failed for %r: %s", query, e)
+            return []
+
     def shutdown(self) -> None:
         """Tear down all clients and stop the background loop."""
         if not self._enabled:
@@ -665,6 +769,85 @@ class LSPService:
                 *(client.shutdown() for client in clients),
                 return_exceptions=True,
             )
+
+    # ------------------------------------------------------------------
+    # async internals for symbol tools
+    # ------------------------------------------------------------------
+
+    async def _async_definition(
+        self,
+        path: str,
+        line: int,
+        character: int,
+        *,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        client = await self._get_or_spawn(path)
+        if client is None:
+            return []
+        try:
+            await client.open_file(path, language_id=language_id_for(path))
+            return await asyncio.wait_for(
+                client.definition(path, line, character), timeout=timeout
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("async definition failed for %s: %s", path, e)
+            return []
+
+    async def _async_references(
+        self,
+        path: str,
+        line: int,
+        character: int,
+        include_declaration: bool,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        client = await self._get_or_spawn(path)
+        if client is None:
+            return []
+        try:
+            await client.open_file(path, language_id=language_id_for(path))
+            return await asyncio.wait_for(
+                client.references(path, line, character, include_declaration=include_declaration),
+                timeout=timeout,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("async references failed for %s: %s", path, e)
+            return []
+
+    async def _async_document_symbols(
+        self,
+        path: str,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        client = await self._get_or_spawn(path)
+        if client is None:
+            return []
+        try:
+            await client.open_file(path, language_id=language_id_for(path))
+            return await asyncio.wait_for(
+                client.document_symbols(path), timeout=timeout
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("async document_symbols failed for %s: %s", path, e)
+            return []
+
+    async def _async_workspace_symbols(
+        self,
+        query: str,
+        anchor_path: str,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        client = await self._get_or_spawn(anchor_path)
+        if client is None:
+            return []
+        try:
+            return await asyncio.wait_for(
+                client.workspace_symbols(query), timeout=timeout
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("async workspace_symbols failed for %r: %s", query, e)
+            return []
 
     async def _shutdown_async(self) -> None:
         reaper = self._idle_reaper_task

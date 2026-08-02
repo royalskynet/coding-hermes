@@ -626,6 +626,40 @@ def _begin_tool_execution(
             pass
 
 
+def _approval_timeout_note(function_name: str, function_result: Any) -> Optional[str]:
+    """Return a log-ready note if *function_result* is a terminal-tool
+    approval that timed out waiting for the user, else ``None``.
+
+    [local-patch] A3: the whole iteration that issued this tool call is
+    consumed by ``agent.iteration_budget`` (see ``conversation_loop.py``
+    around the ``iteration_budget.consume()`` call) even though the tool
+    itself produced nothing but a 300s wait + BLOCKED refusal. We deliberately
+    do NOT refund the iteration here — a model that ignores the "do NOT
+    retry" instruction and re-issues the same command would otherwise be
+    able to stall the turn indefinitely without the budget ever converging.
+    Instead we tag the log line so post-hoc attribution (e.g. "why did this
+    turn hit max_iterations") doesn't require re-deriving it from raw
+    warning text. See fixindex 0033-approval-timeout-iteration-budget.
+    """
+    if function_name != "terminal" or not isinstance(function_result, str):
+        return None
+    try:
+        data = json.loads(function_result)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("approval_outcome") == "timeout":
+        return (
+            "ITERATION-BUDGET-NOTE: this iteration was consumed entirely by "
+            "an approval request that timed out waiting for the user (no "
+            "retry attempted, tool returned BLOCKED). Not refunded — see "
+            "fixindex 0033-approval-timeout-iteration-budget."
+        )
+    return None
+
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -1178,6 +1212,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                # [local-patch] A3: see fixindex 0033-approval-timeout-iteration-budget
+                _budget_note = _approval_timeout_note(function_name, function_result)
+                if _budget_note:
+                    logger.warning(_budget_note)
 
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
@@ -1879,6 +1917,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            # [local-patch] A3: see fixindex 0033-approval-timeout-iteration-budget
+            _budget_note = _approval_timeout_note(function_name, function_result)
+            if _budget_note:
+                logger.warning(_budget_note)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 

@@ -1338,6 +1338,9 @@ class ContextCompressor(ContextEngine):
         self._summary_has_user_turn = None
         self._last_summary_error = None
         self._consecutive_timeout_failures = 0
+        # [local-patch] A4-c: failure taxonomy for the compression summary
+        # path. See fixindex 0033.
+        self._last_summary_error_category = None
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_feasibility_skip = False
@@ -2388,6 +2391,9 @@ class ContextCompressor(ContextEngine):
         # cleared (see get_active_compression_failure_cooldown).
         self._cooldown_persist_failed: bool = False
         self._last_summary_error: Optional[str] = None
+        # [local-patch] A4-c: "timeout" | "malformed_response" | "model_unavailable"
+        # | "unknown" | None (no failure yet). See fixindex 0033.
+        self._last_summary_error_category: Optional[str] = None
         # When summary generation fails and a static fallback is inserted,
         # record how many turns were unrecoverably dropped so callers
         # (gateway hygiene, /compress) can surface a visible warning.
@@ -3876,6 +3882,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_error = None
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
+            # [local-patch] A4-c: clear the failure taxonomy on success.
+            self._last_summary_error_category = None
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -3896,6 +3904,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "no auxiliary LLM provider configured",
                 )
                 self._last_summary_error = "no auxiliary LLM provider configured"
+                # [local-patch] A4-c: keep the taxonomy complete for the
+                # absorbed no-provider branch. See fixindex 0033.
+                self._last_summary_error_category = "no_provider"
                 logger.warning("Context compression: no provider available for "
                                 "summary. Middle turns will be dropped without summary "
                                 "for %d seconds.",
@@ -4045,9 +4056,27 @@ This compaction should PRIORITISE preserving all information related to the focu
             # the auth-failure carve-out; independent of abort_on_summary_failure.
             if _is_streaming_closed:
                 self._last_summary_network_failure = True
+            # [local-patch] A4-c: classify the failure so log-based attribution
+            # doesn't require re-deriving "did the aux model never answer, or
+            # did it answer with something we couldn't parse" from free text.
+            # _is_json_decode wins first — a parseable-but-malformed reply
+            # means the request DID complete, which is a materially different
+            # failure mode from never getting a reply at all. The
+            # logger.warning below interpolates _failure_category, so this
+            # block must stay paired with it. See fixindex 0033.
+            if _is_json_decode:
+                _failure_category = "malformed_response"
+            elif _is_model_not_found:
+                _failure_category = "model_unavailable"
+            elif _is_timeout or _is_streaming_closed:
+                _failure_category = "timeout"
+            else:
+                _failure_category = "unknown"
+            self._last_summary_error_category = _failure_category
             logger.warning(
-                "Failed to generate context summary: %s. "
+                "Failed to generate context summary [category=%s]: %s. "
                 "Further summary attempts paused for %d seconds.",
+                _failure_category,
                 e,
                 _transient_cooldown,
             )
@@ -5981,6 +6010,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_summary_fallback_used = False
         self._last_feasibility_skip = False
         self._last_summary_error = None
+        self._last_summary_error_category = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False

@@ -3,8 +3,10 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import datetime as _dt
 import re
 import sqlite3
+import sys as _sys
 import threading
 from pathlib import Path
 
@@ -13,11 +15,23 @@ try:
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
 
+# Profile-agnostic episodic guard: drops system/cron prompts and anchors relative
+# dates to insertion time. Subject normalization stays profile-specific so it
+# happens in the caller (e.g. dream_consolidate.py), not here.
+try:
+    _sys.path.insert(0, str(Path.home() / ".hermes" / "migration"))
+    from episodic_normalize import is_system_prompt as _is_system_prompt
+    from episodic_normalize import normalize_relative_dates as _normalize_dates
+except Exception:  # pragma: no cover — never break the live store on import failure
+    def _is_system_prompt(_text: str) -> bool: return False
+    def _normalize_dates(text: str, _anchor): return text
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     fact_id         INTEGER PRIMARY KEY AUTOINCREMENT,
     content         TEXT NOT NULL UNIQUE,
     category        TEXT DEFAULT 'general',
+    kind            TEXT DEFAULT 'distilled',
     tags            TEXT DEFAULT '',
     trust_score     REAL DEFAULT 0.5,
     retrieval_count INTEGER DEFAULT 0,
@@ -26,6 +40,7 @@ CREATE TABLE IF NOT EXISTS facts (
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     hrr_vector      BLOB
 );
+CREATE INDEX IF NOT EXISTS idx_facts_kind ON facts(kind);
 
 CREATE TABLE IF NOT EXISTS entities (
     entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,25 +205,33 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        kind: str = "distilled",
     ) -> int:
         """Insert a fact and return its fact_id.
 
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
         the existing fact_id without modifying the row. Extracts entities from
         the content and links them to the fact.
+
+        kind="distilled" (default) — abstracted truth that can stand alone.
+        kind="raw_turn" — verbatim conversation turn; retrieval must surface it
+        as historical context, never as current truth.
         """
         with self._lock:
             content = content.strip()
             if not content:
                 raise ValueError("content must not be empty")
+            if _is_system_prompt(content):
+                raise ValueError("content looks like a system/cron prompt; refusing to store as fact")
+            content = _normalize_dates(content, _dt.datetime.now())
 
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO facts (content, category, kind, tags, trust_score)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (content, category, tags, self.default_trust),
+                    (content, category, kind, tags, self.default_trust),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
