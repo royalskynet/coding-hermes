@@ -8719,6 +8719,11 @@ def call_llm(
                 task,
                 provider=resolved_provider, base_url=_base_info)
         except Exception as transient_err:
+            # Admission control has its own Retry-After contract below.  A
+            # blanket 5xx retry here would shadow that contract and use the
+            # generic exponential backoff instead.
+            if _is_admission_busy_error(transient_err):
+                raise
             if not _is_transient_transport_error(transient_err):
                 raise
             # Compression is on the critical preflight path: a user cannot
@@ -8766,6 +8771,8 @@ def call_llm(
                         ),
                         task)
                 except Exception as retry_transient:
+                    if _is_admission_busy_error(retry_transient):
+                        raise
                     if not _is_transient_transport_error(retry_transient):
                         raise
                     _last_transient = retry_transient
@@ -8820,7 +8827,25 @@ def call_llm(
             time.sleep(wait_s)
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                    _relay_sync_completion(
+                        client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                        create=lambda request: _create_with_progress(
+                            client,
+                            request,
+                            task,
+                            force_stream=_provider_requires_stream(
+                                resolved_provider,
+                                _base_info or resolved_base_url,
+                            ),
+                        ),
+                    ),
+                    task,
+                    provider=resolved_provider,
+                    base_url=_base_info,
+                )
             except Exception as retry_err:
                 first_err = retry_err
 
@@ -9413,6 +9438,10 @@ async def async_call_llm(
                 task,
                 provider=resolved_provider, base_url=_client_base)
         except Exception as transient_err:
+            # Admission control has a distinct Retry-After contract below;
+            # do not let the generic 5xx retry shadow it.
+            if _is_admission_busy_error(transient_err):
+                raise
             if not _is_transient_transport_error(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
@@ -9483,7 +9512,17 @@ async def async_call_llm(
             await asyncio.sleep(wait_s)
             try:
                 return _validate_llm_response(
-                    await client.chat.completions.create(**kwargs), task)
+                    await _relay_async_completion(
+                        client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                        create=_acreate,
+                    ),
+                    task,
+                    provider=resolved_provider,
+                    base_url=_client_base,
+                )
             except Exception as retry_err:
                 first_err = retry_err
 
