@@ -110,8 +110,12 @@ class FactRetriever:
         fts_candidates = self._fts_candidates(query, category, min_trust, limit * 3)
         # Stage 1b: HRR semantic candidates (catches CJK queries that FTS5 mistokenizes,
         # never-seen tokens, and multi-token natural-language phrasings)
-        hrr_candidates = (self._hrr_candidates(query, category, min_trust, limit * 3)
-                          if self.hrr_weight > 0 else [])
+        if self.hrr_weight > 0:
+            hrr_candidates, query_vec = self._hrr_candidates(
+                query, category, min_trust, limit * 3
+            )
+        else:
+            hrr_candidates, query_vec = [], None
         seen_ids = {f["fact_id"] for f in fts_candidates}
         candidates = fts_candidates + [h for h in hrr_candidates
                                        if h["fact_id"] not in seen_ids]
@@ -121,15 +125,9 @@ class FactRetriever:
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
-        # The query vector is loop-invariant — encode it at most once, on
-        # the first candidate that actually carries an HRR vector. Lazy on
-        # purpose: migrated stores can have FTS candidates whose hrr_vector
-        # was never backfilled (MemoryStore._init_db adds the column
-        # without backfilling), and those must not pay for an encode
-        # nothing will use. encode_text is deterministic (SHA-256 counter
-        # blocks), so the hoisted vector is bit-identical to what the
-        # per-candidate calls produced.
-        query_vec = None
+        # Prefer the query vector already encoded by Stage 1b. Only if Stage 1b
+        # produced no vector while an FTS candidate has an HRR vector does
+        # Stage 2 lazily encode the query, at most once.
         scored = []
 
         for fact in candidates:
@@ -625,16 +623,16 @@ class FactRetriever:
         category: str | None,
         min_trust: float,
         limit: int,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], object | None]:
         """Get raw HRR-semantic candidates (Plate 1995 holographic recall).
 
         Full scan over facts with hrr_vector (cheap at <10k rows). Returns
-        top-N by cosine similarity to query encoding. Bypasses FTS5
-        tokenization so CJK natural-language queries and never-indexed
-        tokens still surface relevant facts.
+        top-N by cosine similarity plus the query vector so Stage 2 can reuse
+        the same deterministic encoding. Bypasses FTS5 tokenization so CJK
+        natural-language queries and never-indexed tokens still surface facts.
         """
         if not hrr._HAS_NUMPY:
-            return []
+            return [], None
         conn = self.store._conn
 
         where = ["hrr_vector IS NOT NULL", "trust_score >= ?"]
@@ -653,10 +651,10 @@ class FactRetriever:
         try:
             rows = conn.execute(sql, params).fetchall()
         except Exception:
-            return []
+            return [], None
 
         if not rows:
-            return []
+            return [], None
 
         query_vec = hrr.encode_text(query, self.hrr_dim)
         scored: list[tuple[float, dict]] = []
@@ -675,7 +673,8 @@ class FactRetriever:
         # (any query vs unrelated fact). Real semantic hits land 0.6+.
         HRR_MIN_SIM = float(os.environ.get("HOLO_HRR_THRESHOLD", "0.55"))
         scored.sort(key=lambda x: -x[0])
-        return [fact for sim, fact in scored[:limit] if sim >= HRR_MIN_SIM]
+        candidates = [fact for sim, fact in scored[:limit] if sim >= HRR_MIN_SIM]
+        return candidates, query_vec
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:

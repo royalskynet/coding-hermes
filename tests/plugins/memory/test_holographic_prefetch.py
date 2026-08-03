@@ -24,6 +24,20 @@ from plugins.memory.holographic import HolographicMemoryProvider
 NOW = datetime(2026, 7, 26, 12, 0, 0)
 
 
+class _FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW if tz is None else NOW.replace(tzinfo=tz)
+
+
+@pytest.fixture
+def fixed_now(monkeypatch):
+    """Freeze the datetime class imported inside provider.prefetch()."""
+    import datetime as datetime_module
+
+    monkeypatch.setattr(datetime_module, "datetime", _FixedDateTime)
+
+
 def _make_result(kind="distilled", content="test fact", trust=0.5,
                  created_at: datetime | None = None) -> dict:
     """Build a single search result dict matching FactRetriever output shape."""
@@ -99,7 +113,7 @@ class TestPrefetchRawCap:
 class TestPrefetchRawAgeFilter:
     """age > 30d raw_turn 被過濾."""
 
-    def test_old_raw_excluded_at_31_days(self):
+    def test_old_raw_excluded_at_31_days(self, fixed_now):
         p = _setup_provider(raw_max=5, raw_max_age=30)
         old_date = NOW - timedelta(days=32)
         p._retriever.search.return_value = [
@@ -111,7 +125,7 @@ class TestPrefetchRawAgeFilter:
         # Old raw excluded by age filter
         assert "## 過往對話片段" not in out
 
-    def test_recent_raw_kept_at_10_days(self):
+    def test_recent_raw_kept_at_10_days(self, fixed_now):
         p = _setup_provider(raw_max=5, raw_max_age=30)
         recent = NOW - timedelta(days=10)
         p._retriever.search.return_value = [
@@ -121,6 +135,17 @@ class TestPrefetchRawAgeFilter:
             mock_fmt.return_value = " · 10天前"
             out = p.prefetch("test")
         assert "recent raw" in out
+
+    def test_future_raw_kept_at_30_days(self, fixed_now):
+        p = _setup_provider(raw_max=5, raw_max_age=30)
+        future = NOW + timedelta(days=30)
+        p._retriever.search.return_value = [
+            _make_result("raw_turn", "future raw", trust=0.9, created_at=future),
+        ]
+        with patch("plugins.memory.holographic.HolographicMemoryProvider._format_age") as mock_fmt:
+            mock_fmt.return_value = " · 今天"
+            out = p.prefetch("test")
+        assert "future raw" in out
 
 
 class TestPrefetchConfig:
@@ -135,14 +160,14 @@ class TestPrefetchConfig:
         # raw_max=0 → entire raw section omitted
         assert "## 過往對話片段" not in out
 
-    def test_raw_max_age_custom_7(self):
+    def test_raw_max_age_custom_7(self, fixed_now):
         p = _setup_provider(raw_max=10, raw_max_age=7)
-        within7 = NOW - timedelta(days=5)
+        within7 = NOW - timedelta(days=7)
         p._retriever.search.return_value = [
             _make_result("raw_turn", "inside window", trust=0.5, created_at=within7),
         ]
         with patch("plugins.memory.holographic.HolographicMemoryProvider._format_age") as mock_fmt:
-            mock_fmt.return_value = " · 5天前"
+            mock_fmt.return_value = " · 7天前"
             out = p.prefetch("query")
         assert "inside window" in out
 
