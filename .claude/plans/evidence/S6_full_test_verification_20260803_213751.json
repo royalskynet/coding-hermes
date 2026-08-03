@@ -1,0 +1,76 @@
+{
+  "timestamp": "2026-08-03T21:37:50.888443",
+  "targeted_tests": {
+    "tests/scripts/test_profile_health_check.py": {
+      "status": "MISSING"
+    },
+    "tests/scripts/test_lsp_availability.py": {
+      "status": "MISSING"
+    },
+    "tests/scripts/test_lsp_real_server.py": {
+      "status": "MISSING"
+    },
+    "tests/scripts/test_build_skills_index_health.py": {
+      "status": "MISSING"
+    },
+    "tests/scripts/test_contributor_map.py": {
+      "status": "MISSING"
+    },
+    "tests/scripts/test_footgun_subprocess_encoding.py": {
+      "status": "MISSING"
+    },
+    "tests/scripts/test_smoke_nemo_relay_shared_metrics.py": {
+      "status": "MISSING"
+    },
+    "tests/tools/test_lsp_availability.py": {
+      "status": "MISSING"
+    }
+  },
+  "whitespace": {
+    "scripts/observability/profile_health_check.py": 1,
+    "tests/scripts/test_profile_health_check.py": 26,
+    "tools/lsp_tool.py": 0,
+    "agent/background_review.py": 0
+  },
+  "secrets": {
+    "scripts/observability/profile_health_check.py": {},
+    "tests/scripts/test_profile_health_check.py": {
+      "bearer_token": 2,
+      "api_key": 1
+    },
+    "tools/lsp_tool.py": {
+      "long_token": 11
+    },
+    "agent/background_review.py": {
+      "long_token": 2,
+      "api_key": 2
+    }
+  },
+  "py_compile": {
+    "scripts/observability/profile_health_check.py": true,
+    "tests/scripts/test_profile_health_check.py": true,
+    "tools/lsp_tool.py": true,
+    "agent/background_review.py": true
+  },
+  "cli_help": {
+    "exit_code": 0,
+    "has_output": true
+  },
+  "json_schema": {
+    "exit_code": 0,
+    "missing_keys": [
+      "provider_failure",
+      "background_review_denied",
+      "telegram_audit",
+      "lsp_usage",
+      "overall_status"
+    ],
+    "has_all": false
+  },
+  "exit_matrix": {
+    "json_exit": 0,
+    "human_exit": 0,
+    "consistent": true
+  },
+  "overall": "FAIL"
+}

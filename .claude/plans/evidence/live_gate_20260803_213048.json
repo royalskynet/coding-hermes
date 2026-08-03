@@ -1,0 +1,143 @@
+{
+  "timestamp": "2026-08-03T21:30:48.708844",
+  "profile": "mannie",
+  "overall": "FAIL",
+  "gates": {
+    "G1": {
+      "gate": "G1",
+      "name": "Repo Integrity",
+      "status": "FAIL",
+      "evidence": {
+        "head_sha": "cce4becacd5bdca9aff4da8453463736b8a3a207",
+        "dirty_count": 5,
+        "dirty_files": [
+          "?? scripts/observability/mannie_live_gate.py",
+          "?? scripts/observability/profile_health_check.py",
+          "?? tests/scripts/test_lsp_real_server.py",
+          "?? tests/scripts/test_profile_health_check.py",
+          "?? tests/tools/test_lsp_availability.py"
+        ],
+        "unexpected_dirty": [
+          "?? scripts/observability/mannie_live_gate.py",
+          "?? scripts/observability/profile_health_check.py",
+          "?? tests/scripts/test_profile_health_check.py",
+          "?? tests/tools/test_lsp_availability.py"
+        ],
+        "unmerged_branches": [
+          "safety/pre-upstream-rebase-20260803-140625",
+          "safety/pre-upstream-refresh-20260803-142010",
+          "remotes/origin/safety/pre-upstream-rebase-20260803-140625",
+          "remotes/origin/safety/pre-upstream-refresh-20260803-142010",
+          "remotes/upstream/UI",
+          "remotes/upstream/add-morph-snapshot",
+          "remotes/upstream/add-prokletor",
+          "remotes/upstream/add-upstream-atropos-tool-use-changes",
+          "remotes/upstream/alice/nous-portal-recommended-models",
+          "remotes/upstream/api-server-enforce-key"
+        ],
+        "wip_commits": []
+      },
+      "reasons": [
+        "Unexpected dirty files: ['?? scripts/observability/mannie_live_gate.py', '?? scripts/observability/profile_health_check.py', '?? tests/scripts/test_profile_health_check.py', '?? tests/tools/test_lsp_availability.py']"
+      ],
+      "duration_ms": 527
+    },
+    "G2": {
+      "gate": "G2",
+      "name": "Health Checker Contract",
+      "status": "WARN",
+      "evidence": {
+        "cli_help_exit": 1,
+        "json_exit": 1,
+        "json_parsed": true,
+        "schema_keys": [],
+        "human_exit": 1,
+        "human_has_overall": false,
+        "exit_consistency": true
+      },
+      "reasons": [
+        "CLI help exit 1",
+        "JSON missing keys: ['provider_failure', 'background_review_denied', 'telegram_audit', 'lsp_usage', 'overall_status']"
+      ],
+      "duration_ms": 97
+    },
+    "G3": {
+      "gate": "G3",
+      "name": "Real LSP Probe",
+      "status": "FAIL",
+      "evidence": {
+        "lsp_definition_exit": 1,
+        "lsp_output_preview": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n  File \"/Users/51mini/.hermes/hermes-agent/tools/lsp_tool.py\", line 15, in <module>\n    from tools.registry import registry\n  File \"/Users/51mini/.hermes/hermes-agent/tools/registry.py\", line 349, in <module>\n    class ToolRegistry:\n  File \"/Users/51mini/.hermes/hermes-agent/tools/registry.py\", line 508, in ToolRegistry\n    max_result_size_chars: int | float | None = None,\nTypeError: unsupported operand type(s) for |: 'typ",
+        "real_server": false
+      },
+      "reasons": [
+        "LSP definition did not return expected symbols (may be mock)",
+        "LSP probe failed exit 1"
+      ],
+      "duration_ms": 25
+    },
+    "G4": {
+      "gate": "G4",
+      "name": "BG Review Trend",
+      "status": "WARN",
+      "evidence": {
+        "script_exit": 0,
+        "output": "## S3 \u2014 Background Review \u8b49\u64da\u91cd\u7b97\n\n### pre-fix (2026-08-02 00:00-18:00 +08)\n\n- **Window**: 2026-08-02T00:00:00+08:00 \u2192 2026-08-02T18:00:00+08:00\n- **Lines in window**: 9580\n- **Review turns**: 4\n- **Denies (total)**: 47\n- **Denies per turn** (**denominator = turns**): 11.75\n\n| Tool | Deny Count | Denies/turn |\n|------|-----------|-------------|\n| `read_file` | 16 | 4.0 |\n| `execute_code` | 13 | 3.25 |\n| `search_files` | 6 | 1.5 |\n| `session_search` | 4 | 1.0 |\n| `patch` | 3 | 0.75 |\n| `write_file` | 2 | 0.5 |\n| `todo` | 2 | 0.5 |\n| `process` | 1 | 0.25 |\n\n### post-fix (2026-08-02 19:00-08-03 12:00 +08)\n\n- **Window**: 2026-08-02T19:00:00+08:00 \u2192 2026-08-03T12:00:00+08:00\n- **Lines in window**: 22776\n- **Review turns**: 10\n- **Denies (total)**: 49\n- **Denies per turn** (**denominator = turns**): 4.9\n\n| Tool | Deny Count | Denies/turn |\n|------|-----------|-------------|\n| `read_file` | 16 | 1.6 |\n| `execute_code` | 13 | 1.3 |\n| `search_files` | 6 | 0.6 |\n| `todo` | 4 | 0.4 |\n| `patch` | 4 | 0.4 |\n| `session_search` | 3 | 0.3 |\n| `write_file` | 2 | 0.2 |\n| `process` | 1 | 0.1 |\n\n",
+        "post_fix_ratio": 4.9,
+        "post_fix_turns": 10,
+        "post_fix_denies": 49,
+        "trend": "decreasing"
+      },
+      "reasons": [
+        "BG review denies/turn = 4.90 (threshold 1.0-5.0 WARN)"
+      ],
+      "duration_ms": 401
+    },
+    "G5": {
+      "gate": "G5",
+      "name": "Kanban + Gateway",
+      "status": "WARN",
+      "evidence": {
+        "kanban_db_exists": false,
+        "kanban_db_readable": false,
+        "gateway_reachable": false,
+        "plugin_load": 1
+      },
+      "reasons": [
+        "Kanban DB not readable"
+      ],
+      "duration_ms": 77
+    },
+    "G6": {
+      "gate": "G6",
+      "name": "Tests + Security Scan",
+      "status": "PASS",
+      "evidence": {
+        "targeted": {
+          "tests/scripts/test_profile_health_check.py": "MISSING",
+          "tests/scripts/test_lsp_availability.py": "MISSING",
+          "tests/scripts/test_lsp_real_server.py": "MISSING"
+        },
+        "secret_scan": {},
+        "total_secrets": 0,
+        "whitespace": {}
+      },
+      "reasons": [],
+      "duration_ms": 0
+    },
+    "G7": {
+      "gate": "G7",
+      "name": "Coding Turn Observation",
+      "status": "WARN",
+      "evidence": {
+        "file_tool_exit": 1,
+        "file_tool_output": "",
+        "omniroute_key": "SET"
+      },
+      "reasons": [
+        "File tool test exit 0: sk-bc73d27...\n"
+      ],
+      "duration_ms": 57
+    }
+  }
+}

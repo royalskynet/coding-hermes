@@ -1,0 +1,96 @@
+{
+  "timestamp": "2026-08-03T21:41:04.505748",
+  "targeted_tests": {
+    "tests/scripts/test_profile_health_check.py": {
+      "exit_code": 0,
+      "passed": true,
+      "stdout_tail": "e: pyproject.toml\nplugins: ddtrace-4.10.0, xdist-3.8.0, Faker-40.19.1, typeguard-4.5.2, asyncio-1.3.0, anyio-4.13.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollected 31 items\n\ntests/scripts/test_profile_health_check.py ............................. [ 93%]\n..                                                                       [100%]\n\n============================== 31 passed in 0.77s ==============================\n",
+      "stderr_tail": ""
+    },
+    "tests/scripts/test_lsp_availability.py": {
+      "status": "MISSING"
+    },
+    "tests/scripts/test_lsp_real_server.py": {
+      "exit_code": 1,
+      "passed": false,
+      "stdout_tail": "/docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED tests/scripts/test_lsp_real_server.py::test_real_pyright_server - Asse...\nFAILED tests/scripts/test_lsp_real_server.py::test_broken_set_behavior - Asse...\n==================== 2 failed, 1 passed, 1 warning in 1.07s ====================\n",
+      "stderr_tail": "g cb=[Task.task_wakeup()]>>\nTask was destroyed but it is pending!\ntask: <Task pending name='Task-33' coro=<LSPService._idle_reaper_loop() done, defined at /Users/51mini/.hermes/hermes-agent/agent/lsp/manager.py:738> wait_for=<Future pending cb=[Task.task_wakeup()]>>\nTask was destroyed but it is pending!\ntask: <Task pending name='Task-16' coro=<LSPService._idle_reaper_loop() running at /Users/51mini/.hermes/hermes-agent/agent/lsp/manager.py:741> wait_for=<Future pending cb=[Task.task_wakeup()]>>\n"
+    },
+    "tests/scripts/test_build_skills_index_health.py": {
+      "exit_code": 0,
+      "passed": true,
+      "stdout_tail": " pytest-9.0.3, pluggy-1.6.0\nrootdir: /Users/51mini/.hermes/hermes-agent\nconfigfile: pyproject.toml\nplugins: ddtrace-4.10.0, xdist-3.8.0, Faker-40.19.1, typeguard-4.5.2, asyncio-1.3.0, anyio-4.13.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollected 2 items\n\ntests/scripts/test_build_skills_index_health.py ..                       [100%]\n\n============================== 2 passed in 1.07s ===============================\n",
+      "stderr_tail": ""
+    },
+    "tests/scripts/test_contributor_map.py": {
+      "exit_code": 0,
+      "passed": true,
+      "stdout_tail": " pytest-9.0.3, pluggy-1.6.0\nrootdir: /Users/51mini/.hermes/hermes-agent\nconfigfile: pyproject.toml\nplugins: ddtrace-4.10.0, xdist-3.8.0, Faker-40.19.1, typeguard-4.5.2, asyncio-1.3.0, anyio-4.13.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollected 7 items\n\ntests/scripts/test_contributor_map.py .......                            [100%]\n\n============================== 7 passed in 0.18s ===============================\n",
+      "stderr_tail": ""
+    },
+    "tests/scripts/test_footgun_subprocess_encoding.py": {
+      "exit_code": 0,
+      "passed": true,
+      "stdout_tail": " pytest-9.0.3, pluggy-1.6.0\nrootdir: /Users/51mini/.hermes/hermes-agent\nconfigfile: pyproject.toml\nplugins: ddtrace-4.10.0, xdist-3.8.0, Faker-40.19.1, typeguard-4.5.2, asyncio-1.3.0, anyio-4.13.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollected 9 items\n\ntests/scripts/test_footgun_subprocess_encoding.py .........              [100%]\n\n============================== 9 passed in 1.56s ===============================\n",
+      "stderr_tail": ""
+    },
+    "tests/scripts/test_smoke_nemo_relay_shared_metrics.py": {
+      "exit_code": 0,
+      "passed": true,
+      "stdout_tail": " pytest-9.0.3, pluggy-1.6.0\nrootdir: /Users/51mini/.hermes/hermes-agent\nconfigfile: pyproject.toml\nplugins: ddtrace-4.10.0, xdist-3.8.0, Faker-40.19.1, typeguard-4.5.2, asyncio-1.3.0, anyio-4.13.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollected 4 items\n\ntests/scripts/test_smoke_nemo_relay_shared_metrics.py ....               [100%]\n\n============================== 4 passed in 0.10s ===============================\n",
+      "stderr_tail": ""
+    },
+    "tests/tools/test_lsp_availability.py": {
+      "exit_code": 0,
+      "passed": true,
+      "stdout_tail": "pytest-9.0.3, pluggy-1.6.0\nrootdir: /Users/51mini/.hermes/hermes-agent\nconfigfile: pyproject.toml\nplugins: ddtrace-4.10.0, xdist-3.8.0, Faker-40.19.1, typeguard-4.5.2, asyncio-1.3.0, anyio-4.13.0\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollected 27 items\n\ntests/tools/test_lsp_availability.py ...........................         [100%]\n\n============================== 27 passed in 0.41s ==============================\n",
+      "stderr_tail": ""
+    }
+  },
+  "whitespace": {
+    "scripts/observability/profile_health_check.py": 1,
+    "tests/scripts/test_profile_health_check.py": 26,
+    "tools/lsp_tool.py": 0,
+    "agent/background_review.py": 0
+  },
+  "secrets": {
+    "scripts/observability/profile_health_check.py": {},
+    "tests/scripts/test_profile_health_check.py": {
+      "bearer_token": 2,
+      "api_key": 1
+    },
+    "tools/lsp_tool.py": {
+      "long_token": 1
+    },
+    "agent/background_review.py": {
+      "api_key": 2
+    }
+  },
+  "py_compile": {
+    "scripts/observability/profile_health_check.py": true,
+    "tests/scripts/test_profile_health_check.py": true,
+    "tools/lsp_tool.py": true,
+    "agent/background_review.py": true
+  },
+  "cli_help": {
+    "exit_code": 0,
+    "has_output": true
+  },
+  "json_schema": {
+    "exit_code": 0,
+    "missing_keys": [
+      "provider_failure",
+      "background_review_denied",
+      "telegram_audit",
+      "lsp_usage",
+      "overall_status"
+    ],
+    "has_all": false
+  },
+  "exit_matrix": {
+    "json_exit": 0,
+    "human_exit": 0,
+    "consistent": true
+  },
+  "overall": "FAIL"
+}
