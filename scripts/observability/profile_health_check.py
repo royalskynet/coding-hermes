@@ -85,7 +85,7 @@ def parse_log_timestamp(line: str) -> Optional[datetime]:
     """
     Extract timestamp from Hermes log line.
     Expected format: YYYY-MM-DD HH:MM:SS,mmm LEVEL ...
-    
+
     Naive log timestamps (no TZ) are interpreted as local Asia/Taipei timezone (UTC+8).
     Offset-aware --since values are compared in UTC.
     """

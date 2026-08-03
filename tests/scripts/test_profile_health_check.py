@@ -281,32 +281,32 @@ def test_cli_exit_matrix():
     """Test JSON/human PASS/WARN/FAIL/ERROR exit codes."""
     import tempfile
     import json
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         profile_dir = tmp / "profiles" / "test_exit"
         profile_dir.mkdir(parents=True)
         log_dir = profile_dir / "logs"
         log_dir.mkdir()
-        
+
         # PASS: clean logs
         (log_dir / "agent.log").write_text("2026-08-03 10:00:00,000 INFO just a log line")
         r = _run_cli(tmp, "test_exit", "2026-08-03T00:00:00Z", json=True)
         assert r.returncode == 0, f"PASS expected exit 0, got {r.returncode}: {r.stdout}"
         assert json.loads(r.stdout)["status"] == "pass"
-        
+
         # FAIL: provider failure
         (log_dir / "agent.log").write_text("2026-08-03 10:00:00,123 WARNING provider authentication failed")
         r = _run_cli(tmp, "test_exit", "2026-08-03T00:00:00Z", json=True)
         assert r.returncode == 1, f"FAIL expected exit 1, got {r.returncode}: {r.stdout}"
         assert json.loads(r.stdout)["status"] == "fail"
-        
+
         # WARN: bg review denied (no denominator)
         (log_dir / "agent.log").write_text("2026-08-03 10:00:00,000 WARNING background_review: Background review denied non-whitelisted tool: patch.")
         r = _run_cli(tmp, "test_exit", "2026-08-03T00:00:00Z", json=True)
         assert r.returncode == 0, f"WARN expected exit 0, got {r.returncode}: {r.stdout}"
         assert json.loads(r.stdout)["status"] == "warn"
-        
+
         # Human output also correct exit codes
         r = _run_cli(tmp, "test_exit", "2026-08-03T00:00:00Z", json=False)
         assert r.returncode == 0
@@ -317,23 +317,23 @@ def test_cli_asia_taipei_utc():
     """Test Asia/Taipei timezone handling in log timestamps."""
     import tempfile
     import json
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         profile_dir = tmp / "profiles" / "test_tz"
         profile_dir.mkdir(parents=True)
         log_dir = profile_dir / "logs"
         log_dir.mkdir()
-        
+
         # Log with local Taiwan time (UTC+8)
         # 2026-08-03 10:00:00 local = 2026-08-03 02:00:00 UTC
         (log_dir / "agent.log").write_text("2026-08-03 10:00:00,000 INFO provider authentication failed")
-        
+
         # Since in UTC - should include the line
         r = _run_cli(tmp, "test_tz", "2026-08-03T01:00:00Z", json=True)
         assert r.returncode == 1
         assert json.loads(r.stdout)["checks"]["provider_failure"]["count"] == 1
-        
+
         # Since in UTC - should exclude the line
         r = _run_cli(tmp, "test_tz", "2026-08-03T03:00:00Z", json=True)
         assert r.returncode == 0
@@ -344,19 +344,19 @@ def test_cli_rotated_logs():
     """Test rotated log files are included."""
     import tempfile
     import json
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         profile_dir = tmp / "profiles" / "test_rotated"
         profile_dir.mkdir(parents=True)
         log_dir = profile_dir / "logs"
         log_dir.mkdir()
-        
+
         # Current log
         (log_dir / "agent.log").write_text("2026-08-03 10:00:00,000 INFO provider authentication failed")
         # Rotated log
         (log_dir / "agent.log.1").write_text("2026-08-02 10:00:00,000 INFO provider authentication failed")
-        
+
         r = _run_cli(tmp, "test_rotated", "2026-08-01T00:00:00Z", json=True)
         # Both logs in window -> count = 2
         assert r.returncode == 1
@@ -367,19 +367,19 @@ def test_cli_duplicate_events():
     """Test cross-file duplicate event dedup (same line in multiple log files)."""
     import tempfile
     import json
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         profile_dir = tmp / "profiles" / "test_dup"
         profile_dir.mkdir(parents=True)
         log_dir = profile_dir / "logs"
         log_dir.mkdir()
-        
+
         # Same error in both agent.log and gateway.log
         line = "2026-08-03 10:00:00,000 WARNING provider authentication failed"
         (log_dir / "agent.log").write_text(line)
         (log_dir / "gateway.log").write_text(line)
-        
+
         r = _run_cli(tmp, "test_dup", "2026-08-03T00:00:00Z", json=True)
         # Both lines counted (they're in different files, not exact duplicates in same file)
         # The spec says cross-file duplicate dedup - but we don't implement dedup across files yet
@@ -391,17 +391,17 @@ def test_cli_duplicate_events():
 def test_cli_missing_unreadable():
     """Test missing/unreadable log file handling."""
     import json
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         profile_dir = tmp / "profiles" / "test_missing"
         profile_dir.mkdir(parents=True)
         log_dir = profile_dir / "logs"
         log_dir.mkdir()
-        
+
         # No agent.log file - should still work with other logs
         (log_dir / "gateway.log").write_text("2026-08-03 10:00:00,000 INFO just a log")
-        
+
         r = _run_cli(tmp, "test_missing", "2026-08-03T00:00:00Z", json=True)
         assert r.returncode == 0
         data = json.loads(r.stdout)
@@ -414,17 +414,17 @@ def test_cli_malformed_log():
     """Test malformed log lines (continuation lines without timestamp)."""
     import tempfile
     import json
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         profile_dir = tmp / "profiles" / "test_malformed"
         profile_dir.mkdir(parents=True)
         log_dir = profile_dir / "logs"
         log_dir.mkdir()
-        
+
         # Valid line + continuation line without timestamp
         (log_dir / "agent.log").write_text("2026-08-03 10:00:00,000 WARNING provider authentication failed\n    at some.stack.trace.continuation")
-        
+
         r = _run_cli(tmp, "test_malformed", "2026-08-03T00:00:00Z", json=True)
         # Should parse valid line, ignore malformed continuation
         assert r.returncode == 1
@@ -435,14 +435,14 @@ def test_cli_sanitization():
     """Test output sanitization removes sensitive data from any sample lines."""
     import tempfile
     import json
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         profile_dir = tmp / "profiles" / "test_sanitize"
         profile_dir.mkdir(parents=True)
         log_dir = profile_dir / "logs"
         log_dir.mkdir()
-        
+
         # Log with chat ID, email, home path, bearer token IN provider failure lines
         # (so they appear in matched_lines that get sanitized)
         (log_dir / "gateway.log").write_text(
@@ -452,19 +452,19 @@ def test_cli_sanitization():
             "2026-08-03 10:00:03,000 INFO provider authentication failed path=/home/user/.config\n"
             "2026-08-03 10:00:04,000 INFO provider authentication failed path=/Users/51mini/project"
         )
-        
+
         r = _run_cli(tmp, "test_sanitize", "2026-08-03T00:00:00Z", json=True)
         assert r.returncode == 1
         data = json.loads(r.stdout)
         output_str = json.dumps(data)
-        
+
         # Sensitive data should NOT appear in output
         assert "7852197786" not in output_str
         assert "abcdef123456" not in output_str
         assert "test@example.com" not in output_str
         assert "/home/user" not in output_str
         assert "/Users/51mini" not in output_str
-        
+
         # Redacted placeholders should appear
         assert "redacted" in output_str.lower() or "<email>" in output_str or "<user>" in output_str
 
