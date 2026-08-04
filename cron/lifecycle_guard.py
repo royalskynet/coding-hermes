@@ -35,12 +35,16 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
 import stat
 from pathlib import Path
 from typing import Callable, Iterator, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class GatewayLifecycleBlocked(ValueError):
@@ -313,10 +317,15 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
             # OSError: unreadable/long paths. ValueError: embedded NUL byte
             # from a binary's decoded contents tokenized as a path — a
             # guarded path must never crash the guard (#76762).
+            logger.debug(
+                "_resolve_script_path: unreadable/NUL path %s (err=%s)",
+                script_path,
+                type(e).__name__,
+            )
             resolved = script_path
         if resolved in visited:
             continue

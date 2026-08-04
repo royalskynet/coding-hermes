@@ -174,7 +174,7 @@ def test_real_pyright_server():
             assert inactive_symbols == [], "Inactive service should return empty"
             
             print("\n✅ ALL REAL SERVER TESTS PASSED")
-            return True
+            return
             
         finally:
             # 清理
@@ -226,7 +226,7 @@ def test_broken_set_behavior():
             assert service.enabled_for(str(main_py)) is False, "Should be false due to broken set"
             
             print("✅ BROKEN-SET INJECTION TEST PASSED")
-            return True
+            return
             
         finally:
             try:
@@ -272,7 +272,7 @@ def test_no_result_cases():
             assert ws == [], "Should return empty for non-existent"
             
             print("✅ NO RESULT TESTS PASSED")
-            return True
+            return
             
         finally:
             try:
