@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field, asdict
@@ -77,6 +78,11 @@ DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 # 50KB user message must not become a permanent per-turn tax.
 # See fixindex 0032-max-iterations-no-continuation.
 AUTO_GOAL_MAX_CHARS = 1200
+
+# Kanban iteration checkpoint — written at every iteration boundary so a new
+# kanban worker can pick up where the previous one left off after a budget
+# exhaustion or crash. Stored per-task in ~/.hermes/kanban-checkpoints/.
+CHECKPOINT_DIR = os.path.expanduser("~/.hermes/kanban-checkpoints")
 
 # [local-patch] A2: prefix prepended to the continuation prompt when the
 # turn that just ended hit the iteration ceiling.
@@ -1909,6 +1915,14 @@ def run_kanban_goal_loop(
 
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
+            _checkpoint_dump(task_id, {
+                "iteration": turns_used,
+                "max_turns": max_turns,
+                "verdict": verdict,
+                "reason": reason[:400],
+                "response_snippet": last_response[:2000],
+                "task_status": "blocked_budget",
+            })
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
             try:
                 block_fn(
@@ -1927,6 +1941,76 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
         turns_used += 1
+
+        # [checkpoint] record iteration progress after each successful turn
+        _checkpoint_dump(task_id, {
+            "iteration": turns_used,
+            "max_turns": max_turns,
+            "verdict": verdict,
+            "reason": reason[:400],
+            "response_snippet": last_response[:2000],
+            "task_status": "running",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Kanban iteration checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _checkpoint_dir() -> str:
+    return os.path.expanduser("~/.hermes/kanban-checkpoints")
+
+
+def _checkpoint_dump(task_id: str, state: dict) -> None:
+    """Write the latest kanban iteration checkpoint for a task.
+
+    Overwrites the previous checkpoint — we only need the latest state
+    for resume. Creates the checkpoint directory on first write.
+    """
+    d = _checkpoint_dir()
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{task_id}.json")
+    state["recorded_at"] = time.time()
+    try:
+        with open(path, "w") as f:
+            json.dump(state, f, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        pass  # non-fatal — the loop should not fail because of checkpoint
+
+
+def _checkpoint_load(task_id: str) -> Optional[dict]:
+    """Read the latest kanban iteration checkpoint for a task.
+
+    Returns None when no checkpoint exists (fresh task with no prior runs).
+    """
+    path = os.path.join(_checkpoint_dir(), f"{task_id}.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _checkpoint_readable(task_id: str) -> str:
+    """Return a human-readable resume block for kanban worker context.
+
+    Empty string when no checkpoint exists (fresh task).
+    """
+    cp = _checkpoint_load(task_id)
+    if cp is None:
+        return ""
+    lines = [
+        f"🔁 恢復上次工作（iteration {cp.get('iteration', '?')}/{cp.get('max_turns', '?')}）",
+        f"✅ 最後進度: {cp.get('verdict', '?')} — {cp.get('reason', '?')[:200]}",
+    ]
+    if cp.get("task_status") == "blocked_budget":
+        lines.append("⛔ 上次 iteration budget 耗盡，需繼續完成")
+    elif cp.get("task_status") == "running":
+        remaining = (cp.get("max_turns", 0) or 0) - (cp.get("iteration", 0) or 0)
+        lines.append(f"⚠️ 剩餘約 {max(0, remaining)} iteration")
+    lines.append("📋 請繼續執行未完成的任務，不要從頭開始。")
+    return "\n".join(lines)
 
 
 __all__ = [
@@ -1954,4 +2038,5 @@ __all__ = [
     "migrate_goal_to_session",
     "judge_goal",
     "run_kanban_goal_loop",
+    "checkpoint_readable",
 ]
