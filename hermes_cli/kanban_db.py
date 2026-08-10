@@ -9302,6 +9302,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
 
+    # Resume checkpoint — if a previous worker exhausted its turn budget on
+    # this task, inject a context block so the replacement worker knows what
+    # was already done and doesn't retry from scratch.
+    try:
+        from hermes_cli.goals import checkpoint_readable as _cp_readable
+        _cp = _cp_readable(task_id)
+        if _cp:
+            lines.append("## Resume context (from previous worker)")
+            lines.append(_cp)
+            lines.append("")
+    except Exception:
+        pass  # best-effort — resume hint is a nice-to-have
+
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
