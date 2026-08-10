@@ -1992,7 +1992,7 @@ def _checkpoint_load(task_id: str) -> Optional[dict]:
         return None
 
 
-def _checkpoint_readable(task_id: str) -> str:
+def checkpoint_readable(task_id: str) -> str:
     """Return a human-readable resume block for kanban worker context.
 
     Empty string when no checkpoint exists (fresh task).
