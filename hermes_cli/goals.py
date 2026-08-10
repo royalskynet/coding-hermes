@@ -1913,14 +1913,29 @@ def run_kanban_goal_loop(
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
 
+        # [checkpoint] Loop-entry dump BEFORE run_turn. If this turn times out
+        # (SIGTERM from max-runtime limit), the checkpoint from the *previous*
+        # iteration is still on disk so the replacement worker can resume.
+        # We write it here (not after judge) because judge is fast (~5s) but
+        # run_turn is slow (60-120s) and is where runtime limits actually hit.
+        _checkpoint_dump(task_id, {
+            "iteration": turns_used,
+            "max_turns": max_turns,
+            "verdict": verdict,
+            "reason": reason[:400],
+            "response_snippet": (last_response or "")[:2000],
+            "task_status": "looping",
+        })
+
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
+            # Overwrite with definitive blocked_budget status
             _checkpoint_dump(task_id, {
                 "iteration": turns_used,
                 "max_turns": max_turns,
                 "verdict": verdict,
                 "reason": reason[:400],
-                "response_snippet": last_response[:2000],
+                "response_snippet": (last_response or "")[:2000],
                 "task_status": "blocked_budget",
             })
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
@@ -1948,7 +1963,7 @@ def run_kanban_goal_loop(
             "max_turns": max_turns,
             "verdict": verdict,
             "reason": reason[:400],
-            "response_snippet": last_response[:2000],
+            "response_snippet": (last_response or "")[:2000],
             "task_status": "running",
         })
 
@@ -2006,7 +2021,7 @@ def checkpoint_readable(task_id: str) -> str:
     ]
     if cp.get("task_status") == "blocked_budget":
         lines.append("⛔ 上次 iteration budget 耗盡，需繼續完成")
-    elif cp.get("task_status") == "running":
+    elif cp.get("task_status") in ("running", "looping"):
         remaining = (cp.get("max_turns", 0) or 0) - (cp.get("iteration", 0) or 0)
         lines.append(f"⚠️ 剩餘約 {max(0, remaining)} iteration")
     lines.append("📋 請繼續執行未完成的任務，不要從頭開始。")
