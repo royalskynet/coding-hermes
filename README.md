@@ -80,6 +80,6 @@ b7e3c8bf  kanban: inject resume checkpoint context in build_worker_context
 ## Related
 
 - [mdispatch](https://github.com/royalskynet/coding-hermes/blob/main/mdispatch) — plan.md dispatch tool used with this fork (embedded in the same repo for portability)
-- [fixindex](https://github.com/royalskynet/fixindex) — featherweight adr-tools clone for the FIX-INDEX system, used in pre-task context lookup
-- [fixindex-log](https://github.com/royalskynet/fixindex-log) — private log database referenced by fixindex
+- [fixindex](https://github.com/royalskynet/fixindex) — featherweight bug runbook CLI for symptom→fix lookup (adr-tools style); used in pre-task context lookup
+- [mdispatch](https://github.com/royalskynet/coding-hermes/blob/main/mdispatch) — plan.md dispatch tool embedded in this repo
 - [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) — upstream source
