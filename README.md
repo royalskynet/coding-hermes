@@ -80,16 +80,18 @@ b7e3c8bf  kanban: inject resume checkpoint context in build_worker_context
 ## Dependencies
 
 - [fixindex](https://github.com/royalskynet/fixindex) — bug runbook CLI for symptom→fix lookup; used in pre-task context lookup
-- [mdispatch](https://github.com/royalskynet/fixindex) — plan.md dispatch tool (colocated with fixindex for unified install; see below)
+- [mdispatch](https://github.com/royalskynet/mdispatch) — plan.md dispatch tool for kanban task creation with falsifiability lint
 - [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) — upstream source
 
 ### Quick install
 
 ```bash
-# fixindex + mdispatch in one shot
+# fixindex
 curl -sSL https://raw.githubusercontent.com/royalskynet/fixindex/main/fixindex \
   | sudo tee /usr/local/bin/fixindex > /dev/null && sudo chmod +x /usr/local/bin/fixindex
-curl -sSL https://raw.githubusercontent.com/royalskynet/fixindex/main/mdispatch \
+
+# mdispatch (separate repo)
+curl -sSL https://raw.githubusercontent.com/royalskynet/mdispatch/main/mdispatch \
   | sudo tee /usr/local/bin/mdispatch > /dev/null && sudo chmod +x /usr/local/bin/mdispatch
 
 # Verify
