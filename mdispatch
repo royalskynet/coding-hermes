@@ -1,0 +1,1138 @@
+#!/usr/bin/env python3
+"""
+mdispatch — dispatch plan.md to Mannie via hermes kanban goal loop.
+Zero third-party deps. Subprocess-only to hermes CLI.
+
+# 職責邊界
+#
+# guard.js（~/.claude/hooks/guard.js）→ PPID 白名單制，管「誰可以執行這個指令」
+#   授權呼叫者（openclaw-gateway / 人類終端）直接放行 SOFT_RULES 只 audit
+#   非授權呼叫者走 SOFT_RULES 硬攔（git push --force、DROP TABLE ...）
+#
+# mdispatch（本程式）→ lint 品質檢查，管「這張工單值不值得 dispatch」
+#   不看誰叫的，規則對所有人一樣。FATAL 違規直接 score=0 拒派。
+#   想繞過用 --min-score 0，但那表示你願意承擔後果。
+"""
+import argparse, hashlib, json, os, re, subprocess, sys, time
+from pathlib import Path
+from typing import Optional
+
+_HERMES = "hermes"
+_ASSIGNEE = "mannie"
+_GT_MIN, _GT_MAX = 1, 12
+_GT_DEFAULT = 6
+_RUNTIME_DEFAULT = "45m"
+_MIN_SCORE_DEFAULT = 60
+_INTERVAL_DEFAULT = 15
+_BODY_CAP = 8 * 1024
+
+_VERIFY_DENY = [
+    r"\btail\s+-f\b", r"\bwatch\s+", r"--watch",
+    r"\bnpm\s+run\s+(dev|start|serve)\b", r"\bnodemon\b",
+    r"\brunserver\b", r"\bserve\b", r"&\s*$",
+]
+
+# ── YAML subset parser ──────
+
+def _parse_fm(text: str) -> dict:
+    idx = text.find("---")
+    if idx != 0:
+        raise ValueError("front matter  首行必須是 ---")
+    end = text.find("\n---", idx + 3)
+    if end == -1:
+        raise ValueError("front matter 缺結尾 ---")
+    return _yaml_dict(text[idx+3:end].strip())
+
+def _yaml_dict(raw: str) -> dict:
+    result = {}
+    lines = raw.splitlines()
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if not ln.strip() or ln.strip().startswith("#"):
+            i += 1; continue
+        m = re.match(r'^(\w[\w_-]*)\s*:\s*(.*)', ln)
+        if m:
+            k = m.group(1)
+            r = m.group(2).strip()
+            if r == '|':
+                vals = []
+                i += 1
+                indent = len(ln) - len(ln.lstrip()) + 2
+                while i < len(lines):
+                    if lines[i].strip() == '':
+                        vals.append('')
+                    elif len(lines[i]) - len(lines[i].lstrip()) < indent:
+                        break
+                    else:
+                        vals.append(lines[i][indent:])
+                    i += 1
+                result[k] = '\n'.join(vals).rstrip()
+                continue
+            elif r == '':
+                v, ni = _yaml_value(lines, i+1)
+                result[k] = v
+                i = ni - 1
+            else:
+                result[k] = r.strip('"').strip("'")
+        i += 1
+    return result
+
+def _yaml_value(lines, start):
+    ln = lines[start]
+    m = re.match(r'^\s*-\s+(.*)', ln)
+    if m:
+        items = []
+        i = start
+        while i < len(lines):
+            m2 = re.match(r'^\s*-\s+(.*)', lines[i])
+            if not m2:
+                break
+            val = m2.group(1).strip()
+            if val == "[]":
+                items.append([])
+            else:
+                items.append(val.strip('"').strip("'"))
+            i += 1
+        return items, i
+    result = {}
+    i = start
+    while i < len(lines):
+        m2 = re.match(r'^\s*(\w[\w-]*)\s*:\s*(.*)', lines[i])
+        if not m2:
+            break
+        val = m2.group(2).strip().strip('"').strip("'")
+        result[m2.group(1)] = val
+        i += 1
+    return result, i
+
+# ── Lint (verify falsifiability) ──────
+
+_LINT_L2_PREFIX_OK = [
+    '負向控制', '正向控制', '紅樣本', '綠樣本',
+]
+
+_LINT_L2_COMMANDS_CHECK = [
+    'test', '[', '[[', 'echo', 'grep', 'rg', 'cat', 'ls', 'find',
+    'python', 'python3', 'node', 'bash', 'sh', 'curl', 'wget',
+    'hermes', 'sqlite3', 'mdispatch', 'kanban-guard', 'kanban',
+    'git', 'diff', 'cmp', 'stat', 'wc', 'cut', 'sed', 'awk',
+    'sort', 'uniq', 'head', 'tail', 'cp', 'mv', 'rm',
+    'mkdir', 'rmdir', 'chmod', 'chown', 'touch', 'true', 'false',
+    'command', 'which', 'exec', 'xargs', 'jq', 'yq',
+    'time', 'env', 'uv', 'pip', 'pip3', 'npm', 'npx', 'make', 'go', 'cargo',
+    'lifecycle-push', 'mwork', 'hpush', 'fixindex', 'launchctl', 'pgrep', 'ps',
+]
+
+_LINT_L2_WRAPPERS = {'time', 'env', 'sudo', 'nohup', 'exec', 'command'}
+
+_LINT_L4_TOKENS = re.compile(
+    r'[0-9]+|==|!=|>=|<=|>|<|'
+    r'等於|大於|小於|不等於|大於等於|小於等於|'
+    r'存在|不存在|有結果|無結果|空|非空|非零|輸出|'
+    r'non.?zero|exit.*=.*[0-9]|exit code|output|print|ok|OK|PASS|FAIL',
+    re.IGNORECASE
+)
+
+def _lint_verify(fm: dict) -> list:
+    warns = []
+    vfy = fm.get('verify', [])
+    files = fm.get('files', [])
+    forbidden = fm.get('forbidden', [])
+    file_dirs = set()
+    for f in files:
+        f = str(f).strip().strip("'").strip('"')
+        if f:
+            file_dirs.add(f.rstrip('/') if f != '/' else f)
+
+    def _covered(path: str) -> bool:
+        q = path.rstrip('/')
+        for d in file_dirs:
+            if not d:
+                continue
+            if q == d or q.startswith(d + '/'):
+                return True
+        return False
+
+    for j, v in enumerate(vfy):
+        if not v or not v.strip():
+            continue
+        sv = v.strip()
+        j1 = j + 1
+
+        # L1: grep/rg but target path not in files
+        m = re.search(r'(?:grep|rg)\b.*?([/\w.-]+\.(?:log|txt|json|csv|md|out|err)\b)', sv)
+        if not m:
+            m = re.search(r'(?:grep|rg)\b\s+(?:-[a-zA-Z]+\s+)*.*?\s+(/\S+)', sv)
+        if m:
+            target = m.group(1).rstrip('`\'"),;:。，、）)')
+            if target.startswith('/'):
+                if not _covered(target):
+                    warns.append((j1, 'L1',
+                        f'grep/rg 目標路徑 "{target}" 不在 files  涵蓋範圍'))
+
+        # L2: No executable command feature
+        has_dollar = '$' in sv
+        cmd_head = sv.split()[0] if sv.split() else ''
+        has_prefix = any(sv.startswith(p) for p in _LINT_L2_PREFIX_OK)
+        def _first_real_cmd(text: str) -> str:
+            for tok in text.strip().split():
+                name = tok.lstrip('$ ').split('/')[-1]
+                if not name or name in _LINT_L2_WRAPPERS:
+                    continue
+                return name
+            return ''
+        has_backtick_cmd = any(
+            _first_real_cmd(seg) in _LINT_L2_COMMANDS_CHECK
+            for seg in re.findall(r'`([^`]+)`', sv)
+        )
+        if not has_backtick_cmd and cmd_head in _LINT_L2_WRAPPERS:
+            has_backtick_cmd = _first_real_cmd(sv) in _LINT_L2_COMMANDS_CHECK
+        has_cmd = (cmd_head in _LINT_L2_COMMANDS_CHECK or has_dollar
+                   or has_prefix or has_backtick_cmd)
+        if not has_cmd:
+            warns.append((j1, 'L2',
+                f'無可執行指令特徵 — "{sv[:70]}"'))
+
+        # L3: Absolute path not in files
+        sv_nourl = re.sub(r'\b\w+://\S+', ' ', sv)
+        abs_paths = re.findall(r'(/[^\s\'\"]+)', sv_nourl)
+        for ap in abs_paths:
+            real_ap = ap.rstrip('/').rstrip('`\'"),;:。，、）)')
+            if real_ap == '/' or real_ap.startswith('/proc/') or real_ap.startswith('/dev/'):
+                continue
+            if not os.path.isabs(real_ap) or real_ap.count('/') < 2:
+                continue
+            if not _covered(real_ap):
+                warns.append((j1, 'L3', f'絕對路徑 "{real_ap}" 不在 files  涵蓋範圍'))
+                break
+
+        # L4: No baseline value (but if has_cmd, exit code is baseline)
+        if not has_cmd and not _LINT_L4_TOKENS.search(sv):
+            warns.append((j1, 'L4',
+                f'無可驗證基準值 — "{sv[:70]}"'))
+
+    # L5: Product verification must apply to product itself
+    _L5_APPLY_PAT = re.compile(r'(git\s+apply|patch\b|diffcheck|套用)')
+    _has_diff_output = any(
+        str(f).strip().strip("'\"").endswith(('.diff', '.patch'))
+        for f in files
+    )
+    if _has_diff_output:
+        if not any(_L5_APPLY_PAT.search(v) for v in vfy if v and v.strip()):
+            warns.append((0, 'L5',
+                '產物驗收未作用在產物本身 — files 宣告產出 .diff，但 verify 無任何套用檢查'))
+
+    # L6: Gaming risk — verify only checks string existence
+    _L6_SUBSTR_PAT = re.compile(r'(?:含有|包含|必須含|需含|出現)\s*.{0,40}?'
+                                r'(?:子字串|字串|token|關鍵字|substring)', re.IGNORECASE)
+    _L6_SEMANTIC_OK = re.compile(
+        r'語意|可用|能執行|覆述|對應|後\s*\d+\s*字|各自|分流|完整指令|絕對路徑|'
+        r'實際執行|跑得起來|不得只|不只是|而非|semantic', re.IGNORECASE)
+    for j, v in enumerate(vfy):
+        if not v or not v.strip():
+            continue
+        sv = v.strip()
+        if _L6_SUBSTR_PAT.search(sv) and not _L6_SEMANTIC_OK.search(sv):
+            warns.append((j + 1, 'L6',
+                'gaming  風險：只查字串存在，未要求語意有效 —  執行者可湊關鍵字通過。'
+                '補一條語意判準（例如「每個 sentinel 後 30 字內須有對應處理說明」'
+                '或「請覆述你讀到這段會做什麼」）'))
+
+    # L7: Coverage gap
+    warns += _lint_coverage(fm)
+
+    # L8: Vague wording
+    warns += _lint_vague(fm)
+
+    # L9: touches/write-set mismatch
+    warns += _lint_touches(fm)
+
+    # L10-L13: lessons from omniroute combo accident
+    warns += _lint_immutable(fm)
+    warns += _lint_identifiers(fm)
+    warns += _lint_conclusion(fm)
+    warns += _lint_budget(fm)
+
+    # L16-L19: lessons from 2026-08-10 (工單量尺錯、原檔被改壞)
+    warns += _lint_path_exists(fm)
+    warns += _lint_wiring(fm)
+    warns += _lint_test_runner(fm)
+    warns += _lint_self_tooling(fm)
+    warns += _lint_test_isolation(fm)
+    warns += _lint_iteration_budget(fm)
+
+    # L22-L23: lessons from 2026-08-10 (worker 未提交改壞 kanban_db.py)
+    warns += _lint_repo_discipline(fm)
+
+    return warns
+
+_L7_STOP = {
+    'the','and','for','with','from','this','that','into','not','are','all','any',
+    'you','your','use','using','via','http','https','www','com','org','md','json',
+    'yaml','yml','sh','py','log','txt','id','ok','true','false','null','none',
+}
+
+_CJK = r'[一-鿿]'
+
+_L8_VAGUE = re.compile(
+    r'適當|妥善|盡量|儘量|合理|必要時|如有需要|視情況|等等|之類|其他相關|一併處理|'
+    r'酌情|盡可能|儘可能|優化一下|做好|處理好|完善|改善(?!前後)|穩定性提升|'
+    r'\bas needed\b|\bif necessary\b|\bappropriate(?:ly)?\b|\betc\.?\b|\bproperly\b')
+
+def _cov_tokens(text: str):
+    ids = {t.lower() for t in re.findall(r'[A-Za-z_][A-Za-z0-9_.\-]{2,}', text)}
+    ids = {t for t in ids if t not in _L7_STOP and not t.isdigit()}
+    grams = set()
+    for run in re.findall(_CJK + r'{2,}', text):
+        for i in range(len(run) - 1):
+            grams.add(run[i:i+2])
+    return ids, grams
+
+def _lint_coverage(fm: dict) -> list:
+    warns = []
+    vfy_text = ' '.join(str(v) for v in fm.get('verify', []) if v)
+    v_ids, v_grams = _cov_tokens(vfy_text)
+    if not v_ids and not v_grams:
+        return warns
+
+    units = []
+    for c in re.split(r'[、；;。，,]|\s並\s|(?<=\S)並(?=[^且])', str(fm.get('outcome', ''))):
+        c = c.strip()
+        if len(c) >= 8:
+            units.append(('outcome', c))
+    for h in re.findall(r'^#{3,}\s*(.+)$', fm.get('_body_md', ''), re.MULTILINE):
+        h = re.sub(r'^[\d.\s]+', '', h).strip()
+        if len(h) >= 4:
+            units.append(('步驟', h))
+
+    for kind, u in units:
+        u_ids, u_grams = _cov_tokens(u)
+        if not u_ids and not u_grams:
+            continue
+        if (u_ids & v_ids) or (u_grams & v_grams):
+            continue
+        warns.append((0, 'L7',
+            f'覆蓋缺口：{kind}「{u[:40]}」沒有任何 verify 對得上 —— '
+            f'worker  做不做都不會被抓到。補一條驗收或從 {kind} 刪掉'))
+    return warns
+
+def _lint_vague(fm: dict) -> list:
+    warns = []
+    for label, idx, text in (
+        [('outcome', 0, str(fm.get('outcome', '')))]
+        + [('verify', j + 1, str(v)) for j, v in enumerate(fm.get('verify', []) or [])]
+        + [('stop_when', 0, str(fm.get('stop_when', '')))]
+    ):
+        for m in set(_L8_VAGUE.findall(text)):
+            warns.append((idx, 'L8',
+                f'{label} 出現無法證偽的措辭「{m}」—— worker 交什麼都算數。'
+                f'改成可測陳述（數字、指令、明確檔案）'))
+    return warns
+
+# ── L14–L19: lessons from 2026-08-10 (工單量尺錯、原檔被改壞) ──────
+
+# L15 判準與 agent/file_safety.py 的 PROFILE_SCOPED_AREAS 保持一致。
+# 那邊改了這邊要跟著改，否則 lint 會放行 worker 端擋下的寫入。
+_L15_SCOPED_AREAS = ("skills", "plugins", "cron", "memories")
+_L15_PROFILE_RE = re.compile(r'/profiles/([^/]+)/(' + '|'.join(_L15_SCOPED_AREAS) + r')(?:/|$)')
+_L15_GRANT = re.compile(r'cross_profile|明確授權|explicit user direction', re.IGNORECASE)
+
+
+def _lint_cross_profile(fm: dict) -> list:
+    """L15: 寫入別的 profile 的 scoped area 但工單沒給授權字樣。
+
+    這種工單 100% 會浪費一輪 —— worker 端的 soft guard 會擋，
+    而 comment 給的授權改不到 frontmatter，只能重派。所以是 hard reject 不是 WARN。
+    """
+    targets = [str(t).strip().strip("'\"") for t in (fm.get('touches') or [])]
+    if not targets:
+        targets = [str(f).strip().strip("'\"") for f in (fm.get('files') or [])]
+    # 判準是 worker 執行時的 profile（assignee），不是本機的 active profile ——
+    # soft guard 在 worker 那端跑，本機 active 是誰完全無關。踩過一次：本機 active
+    # 剛好是 koko 時，「mannie 去改 koko 的 cron」會被誤判成自己改自己而放行。
+    assignee = str(fm.get('assignee') or _ASSIGNEE).strip()
+    body = str(fm.get('_body_md', '')) + str(fm.get('outcome', ''))
+    if _L15_GRANT.search(body):
+        return []
+    for t in targets:
+        m = _L15_PROFILE_RE.search(t)
+        if not m:
+            continue
+        owner, area = m.group(1), m.group(2)
+        if owner and owner == assignee:
+            continue          # worker 改自己的 profile，soft guard 不擋
+        return [(0, 'L15',
+            f'touches 寫入 profile「{owner}」的 {area}/ 但正文沒有 cross_profile 或明確授權字樣 —— '
+            f'worker 端 soft guard 會擋下並 blocked，comment 補授權沒用（改不到 frontmatter），'
+            f'只能整張重派。在正文寫明「使用者已授權，寫入時帶 cross_profile=True」')]
+    return []
+
+
+def _lint_path_exists(fm: dict) -> list:
+    """L16: files/touches 的絕對路徑不存在。
+
+    只 WARN 不拒派 —— 工單常合法地列出「要新建的檔」。但整批都不存在
+    通常代表路徑寫錯了 repo（t_08eabf5e 就是這樣拿到 100/100 卻整張路徑錯）。
+    """
+    warns = []
+    seen = set()
+    for key in ('files', 'touches'):
+        for p in (fm.get(key) or []):
+            p = str(p).strip().strip("'\"")
+            if not p.startswith('/') or p in seen:
+                continue
+            seen.add(p)
+            q = p.rstrip('/')
+            if os.path.exists(q):
+                continue
+            # 父目錄存在＝合法的「待新建檔」，不報。父目錄也不存在才是路徑寫錯 repo
+            # （t_08eabf5e 就是這樣拿到 100/100 卻整張指向不存在的 repo）。
+            parent = os.path.dirname(q)
+            if parent and os.path.isdir(parent):
+                continue
+            warns.append((0, 'L16',
+                f'{key}「{p}」不存在，連父目錄「{parent}」也不存在 —— '
+                f'多半是路徑寫錯了 repo'))
+    return warns
+
+
+_L17_NEW_FLAG = re.compile(r'(?:新增|加上|加一個|補上|新加)[^。\n]{0,20}?'
+                           r'(--[a-z][a-z0-9-]{2,})')
+
+
+def _lint_wiring(fm: dict) -> list:
+    """L17: 正文說要新增 CLI 旗標，但沒有 verify 實際 parse 它一次。
+
+    單元測試測的是內層函式，測不到 CLI 到函式之間的接線。
+    t_32b8fe85 加了 --force-soul，49/49 綠，但 handler 根本沒接，旗標永遠無效。
+    """
+    body = str(fm.get('_body_md', ''))
+    flags = {m.group(1) for m in _L17_NEW_FLAG.finditer(body)}
+    if not flags:
+        return []
+    vfy_text = ' '.join(str(v) for v in (fm.get('verify') or []) if v)
+    missing = sorted(f for f in flags if f not in vfy_text)
+    if not missing:
+        return []
+    return [(0, 'L17',
+        f'正文說要新增旗標 {"、".join(missing)} 但沒有任何 verify 實際 parse 它 —— '
+        f'單元測試測不到 CLI 到函式的接線斷掉。補一條：實際 parse 該串參數並 '
+        f'assert 值有傳進目標函式')]
+
+
+# L18: 有 canonical runner 卻叫 worker 直接跑 pytest。
+_L18_BARE_PYTEST = re.compile(r'(?<!run_tests\.sh )\bpytest\b')
+_L18_RUNNER_NAMES = ('scripts/run_tests.sh', 'run_tests.sh', 'scripts/test.sh', 'Makefile')
+
+
+def _lint_test_runner(fm: dict) -> list:
+    """L18: workspace 底下有 canonical test runner，verify 卻寫裸 pytest。
+
+    hermes-agent 的 run_tests.sh 做 per-file subprocess 隔離。裸 pytest 一次收集
+    整個目錄＝關掉隔離，模組層狀態跨檔污染：128 failed vs canonical 的 2 failed。
+    worker 拿假失敗當驗收阻塞，燒光 120/120 iteration（見 fixindex 0383）。
+    """
+    ws = str(fm.get('workspace', ''))
+    if not ws.startswith('dir:'):
+        return []
+    root = ws.split(':', 1)[1].rstrip('/')
+    runner = next((n for n in _L18_RUNNER_NAMES
+                   if os.path.isfile(os.path.join(root, n))), None)
+    if not runner:
+        return []
+    for j, v in enumerate(fm.get('verify') or []):
+        sv = str(v)
+        if _L18_BARE_PYTEST.search(sv) and runner not in sv:
+            return [(j + 1, 'L18',
+                f'{root}/{runner} 是這個 repo 的 canonical test runner，'
+                f'verify 卻叫 worker 直接跑 pytest —— 會繞過 per-file 隔離產生大量假失敗，'
+                f'worker 會拿假失敗當驗收阻塞燒光 iteration。改成跑 {runner}')]
+    return []
+
+
+# L19: touches 指向 PATH 上的可執行工具＝叫 worker 改她自己正在用的工具。
+_L19_TOOL_DIRS = ('/.local/bin/', '/usr/local/bin/', '/opt/homebrew/bin/')
+
+
+def _lint_self_tooling(fm: dict) -> list:
+    """L19: 要改的檔就是 worker 手上的工具本身。
+
+    t_918fadee 叫 worker 改 mdispatch，她就地改寫把原檔弄成三層損毀
+    （185 個 U+FFFD、跳脫層加倍、def main 消失），整條派工鏈停擺。
+    工單寫了「原檔零改動」與 hash 對照 verify —— 兩者都沒生效。
+    真正的防護是不給路徑：把工具複製到工作目錄，files 只列副本。
+    """
+    warns = []
+    for t in (fm.get('touches') or []):
+        t = str(t).strip().strip("'\"")
+        # 判準是「實際存在且可執行」——待新建的檔、.gitignore 這種點檔、
+        # 明確的副本後綴都不算工具本身。誤報過一次：納 git 的工單被這條打到。
+        if (any(d in t for d in _L19_TOOL_DIRS)
+                and not t.endswith(('.new', '.base', '.bak'))
+                and not os.path.basename(t).startswith('.')
+                and os.path.isfile(t)):
+            # 不用 os.access(X_OK) 判斷：受保護的工具會被設成 444 唯讀，
+            # 那樣反而讓這條規則對「最該保護的檔」失效。存在即視為既有工具。
+            warns.append((0, 'L19',
+                f'touches「{t}」是 PATH 上的可執行工具 —— 叫 worker 改她自己正在用的工具，'
+                f'改壞了連驗證都跑不動。改成：先複製一份到工作目錄，files 只列副本，'
+                f'切換由主 session 做'))
+    return warns
+
+# L20: 工單要 worker 寫測試，卻沒要求測試與 live 狀態隔離。
+_L20_WRITES_TESTS = re.compile(r'新增測試|寫測試|補測試|pytest|tests/|test_[a-z]')
+_L20_ISOLATED = re.compile(
+    r'tmp_path|tmpdir|測試專用|沙箱|獨立的?\s*(?:DB|資料庫)|環境變數指到|'
+    r'不得對\s*live|live\s*\w*\s*零改動|monkeypatch|fixture')
+
+
+def _lint_test_isolation(fm: dict) -> list:
+    """L20: 叫 worker 寫測試但沒指定隔離，測試會寫進 live 狀態。
+
+    2026-08-10 t_be12d470（諷刺的是，那張卡本身就是要防「worker 亂建卡」的）
+    的測試直接用 live kanban DB，在正式佇列裡造出 t_a2e8c4b3 與 t_f094c1a6 兩張假卡，
+    其中一張還被 dispatcher 撿走 spawn 成 run 171 —— assignee 是不存在的 profile。
+    工單第 9 條 verify 寫了「live kanban 零改動」，但沒指定「怎麼隔離」，等於沒說。
+    """
+    # 判準要看「真的會產生測試檔」，不是正文出現「測試」兩字就算 ——
+    # lint 規則類的工單會造「測試工單」當樣本，那不碰 live 狀態。
+    paths = [str(x) for x in (fm.get('touches') or []) + (fm.get('files') or [])]
+    vfy = ' '.join(str(v) for v in (fm.get('verify') or []))
+    writes_tests = (any(re.search(r'/tests?/|/tests?$|test_[a-z]', p) for p in paths)
+                    or re.search(r'\bpytest\b|run_tests\.sh', vfy))
+    if not writes_tests:
+        return []
+    hay = str(fm.get('_body_md', '')) + vfy
+    guard = hay + ' '.join(str(f) for f in (fm.get('forbidden') or []))
+    if _L20_ISOLATED.search(guard):
+        return []
+    return [(0, 'L20',
+        '工單要 worker 寫測試，但沒有任何一條 verify 或 forbidden 指定測試怎麼與 live 狀態隔離 —— '
+        '測試會直接寫進正式的 DB／佇列／設定檔。明寫用 tmp_path 或測試專用的 DB／環境變數，'
+        '並補一條「動工前後對照 live 狀態完全相同」的 verify')]
+
+def _lint_touches(fm: dict) -> list:
+    warns = []
+    touches = fm.get('touches') or []
+    if not touches:
+        return warns
+    files = {str(f).strip().strip("'\"").rstrip('/') for f in fm.get('files', [])}
+    for t in touches:
+        t = str(t).strip().strip("'\"").rstrip('/')
+        if not t:
+            continue
+        if t in files:
+            continue
+        if any(t.startswith(f + '/') for f in files if f):
+            continue
+        warns.append((0, 'L9',
+            f'touches「{t}」不在 files  涵蓋範圍 ——  准改的檔必須先在 files 列出'))
+    return warns
+
+_L10_VERB = re.compile(r'修改|更動|改寫|動|刪除|移除|覆寫|覆蓋|調整|重排')
+_L10_SUBJ = re.compile(r'原有|既有|現有|原本|以外|其他|任何|順序|內容|結構|不變|只讀')
+_L10_EXEMPT = re.compile(
+    r'git\s|commit|push|launchctl|pkill|重啟|api\s*key|明文|備份|'
+    r'任何檔案|任何檔|新增檔案')
+_L10_PROOF_STRONG = re.compile(
+    r'sha256|sha1|md5|hash|指紋|字串相等|逐一比對|逐張比對|逐個比對|'
+    r'完全相同|原文比對|前後對照|前後比對')
+_L10_PROOF_WEAK = re.compile(
+    r'未變|沒變|不變|一致|相同|len\(|長度|數量|筆數')
+_L10_NEEDS_STRONG = re.compile(r'內容|順序|結構|一字|原封')
+_L10_TEMPORAL = re.compile(
+    r'動工前|改動前|修改前|變更前|之前記錄|原始值|前後|baseline|基準值|原本的|先按')
+
+def _lint_immutable(fm: dict) -> list:
+    warns = []
+    vfy = [str(v) for v in (fm.get('verify') or []) if v]
+    for f in (fm.get('forbidden') or []):
+        sf = str(f).strip()
+        if _L10_EXEMPT.search(sf.lower()):
+            continue
+        if not (_L10_VERB.search(sf) and _L10_SUBJ.search(sf)):
+            continue
+        subj = sf[:40]
+        ids, grams = _cov_tokens(sf)
+        if not ids and not grams:
+            continue
+        strong_only = bool(_L10_NEEDS_STRONG.search(sf))
+        ok = False
+        for v in vfy:
+            if _L10_PROOF_STRONG.search(v) and _L10_TEMPORAL.search(v):
+                pass
+            elif not strong_only and _L10_PROOF_WEAK.search(v) and _L10_TEMPORAL.search(v):
+                pass
+            else:
+                continue
+            v_ids, v_grams = _cov_tokens(v)
+            if (ids & v_ids) or (grams & v_grams):
+                ok = True
+                break
+        if not ok:
+            lvl = 'sha256／指紋／逐一比對（長度不算，湊得回來）' if strong_only \
+                  else 'sha256／長度／逐一比對'
+            warns.append((0, 'L10',
+                f'forbidden 宣告「{subj}」不可變，但沒有任何 verify 對它做前後對照'
+                f'（{lvl}）—— worker  動了也不會被抓到。'
+                f'補一條：動工前按指紋、改完重算、貼前後兩個 hash'))
+    return warns
+
+_L11_AUTH = re.compile(
+    r'以\s*API|回傳為準|以查出來的為準|重新取得|重新撈|重新打|重打|再打一次|'
+    r'權威來源|逐字比對|不得照抄|不要照抄|即時取得|現場取得|對照來源')
+
+def _lint_identifiers(fm: dict) -> list:
+    body = str(fm.get('_body_md', ''))
+    id_lines = 0
+    for block in re.findall(r'```[^\n]*\n(.*?)```', body, re.S):
+        for ln in block.splitlines():
+            t = ln.strip()
+            if not t or t.startswith(('#', '//', '$', '-', '|')):
+                continue
+            first = t.split()[0]
+            if len(first) >= 5 and ('/' in first or ':' in first) \
+               and not first.startswith(('http', 'https', 'file:')):
+                id_lines += 1
+    if id_lines < 3:
+        return []
+    vtext = ' '.join(str(v) for v in (fm.get('verify') or []) if v)
+    if _L11_AUTH.search(vtext):
+        return []
+    return [(0, 'L11',
+        f'正文列了 {id_lines}  個外部識別碼（model id／connection id／label 之類），'
+        f'但沒有任何 verify 要求從權威來源重新取得並逐字比對 —— '
+        f'worker 可以整批編造再宣告通過。補一條：'
+        f'「重打 <權威端點> 取回清單，與寫進去的值逐字比對，貼出兩邊原文」')]
+
+_L12_CONCL = re.compile(r'結論|判斷|建議|評估|總結')
+_L12_BIND = re.compile(
+    r'根據哪|對得上|覆述|逐句|引用第|哪一行|哪幾行|實測數據|原始輸出|'
+    r'逐條對應|不得只寫|與上表')
+
+def _lint_conclusion(fm: dict) -> list:
+    warns = []
+    for j, v in enumerate(fm.get('verify') or []):
+        sv = str(v).strip()
+        if not sv:
+            continue
+        if _L12_CONCL.search(sv) and not _L12_BIND.search(sv):
+            warns.append((j + 1, 'L12',
+                '要求寫結論卻沒綁實測數據 —— worker 可以對著自己貼出的失敗數字'
+                '寫「全部通過」。補一句：「逐句對得上哪幾行輸出」或'
+                f'「請覆述這段結論是根據哪一行數據寫的」'))
+    return warns
+
+_L13_PER_VERIFY_SEC = 480
+
+def _lint_budget(fm: dict) -> list:
+    n = len([v for v in (fm.get('verify') or []) if str(v).strip()])
+    mr = str(fm.get('max_runtime', '')).strip()
+    if not mr or n == 0:
+        return []
+    try:
+        secs = _parse_dur(mr)
+    except Exception:
+        return []
+    need = n * _L13_PER_VERIFY_SEC
+    if secs >= need:
+        return []
+    return [(0, 'L13',
+        f'{n}  條 verify 但 max_runtime 只有 {mr}（≈{secs // 60}m）；'
+        f'每條抓 {_L13_PER_VERIFY_SEC // 60} 分鐘需要 {need // 60}m。'
+        f'撞到 timeout 會被 failure_limit 判 blocked，即使實質工作已完成')]
+
+# 違反就直接歸零的 lint —— 不是慢慢扣，是整張卡 0 分不能派。
+# L21: >8 verify 必然 iteration budget 炸掉（100% gave_up）
+# L22: workspace 在 hermes-agent repo 但 forbidden 沒保護 kanban 基礎設施
+# L23: workspace 在 git repo 但 verify 不要求末了 git status 檢查
+_LINT_FATAL = {'L21', 'L22', 'L23'}
+
+def lint_score(warns: list) -> int:
+    _LINT_PENALTY = {'L1': 3, 'L2': 2, 'L3': 3, 'L4': 2,
+                     'L5': 10, 'L6': 10, 'L7': 8, 'L8': 5, 'L9': 3,
+                     'L10': 12, 'L11': 12, 'L12': 8, 'L13': 4,
+                     'L16': 3, 'L17': 8, 'L18': 10, 'L19': 10, 'L20': 8,
+                     'L21': 15}
+    if any(l in _LINT_FATAL for _, l, _ in warns):
+        return 0
+    return max(0, 100 - sum(_LINT_PENALTY.get(l, 2) for _, l, _ in warns))
+
+
+def _lint_iteration_budget(fm: dict) -> list:
+    """L21: 工單 verify 太多，iteration 會燒完才改完。FATAL —— 直接歸零。
+
+    Hermes kanban worker 預設 max_turns=100 + goal-max-turns=20 = 120 回合。
+    每條 verify 連改帶測約需 15 回合。超過 8 條驗收就會在 iteration 用完前 gave_up
+    （2026-08-10 t_05ef45ae 14 條 V -> 120/120 gave_up）。
+    手動拆成多份小 plan 重新 dispatch 即可。
+    """
+    n = len([v for v in (fm.get('verify') or []) if str(v).strip()])
+    if n <= 8:
+        return []
+    gmt = int(fm.get('goal_max_turns', _GT_DEFAULT))
+    avail = 100 + gmt  # hermes worker max_turns(100) + goal-max-turns(開卡用)
+    return [(0, 'L21',
+        f'[FATAL] {n} 條 verify 超過 iteration 預算（可用 ~{avail} 回合，'
+        f'估需 ~{n * 15}）—— worker 會在 iteration 用完時 gave_up 而非完成任務。'
+        f'拆成多張工單，每張 ≤8 條 verify')]
+
+
+# workspace 在 hermes-agent repo 根目錄時，這些檔是 kanban 自己的生命線，
+# worker 一碰就是整條 pipeline 全掛（2026-08-10 t_842d1a61 未提交改壞
+# kanban_db.py 的 unblock_task → NameError → 3 張卡全 blocked 無法解）。
+_INFRA_PROTECT = {
+    'hermes_cli/kanban_db.py',
+    'hermes_constants.py',
+    'tools/kanban_tools.py',
+}
+
+
+def _repo_root(ws: str) -> Optional[str]:
+    """從 workspace 值回傳 git repo 根目錄（非 repo 回 None）。"""
+    d = ws.split(':', 1)[1] if ':' in ws else ws
+    d = os.path.expanduser(d)
+    if not os.path.isdir(d):
+        return None
+    p = subprocess.run(['git', '-C', d, 'rev-parse', '--show-toplevel'],
+                       capture_output=True, text=True, timeout=10)
+    if p.returncode != 0:
+        return None
+    return p.stdout.strip()
+
+
+def _lint_repo_discipline(fm: dict) -> list:
+    """L22/L23: repo 內工作的紀律 —— 兩個都是 FATAL。
+
+    L22: workspace 是 hermes-agent repo，但 forbidden 沒保護 kanban 生命線檔。
+         worker 可以（而且歷史證明會）未提交改壞 kanban_db.py 讓 unblock 全掛。
+    L23: workspace 是任何 git repo，但 verify 沒有一條要求結尾 git status --short。
+         殘骸（測試腳本、垃圾檔）必然留在 repo 根目錄沒人發現。
+    """
+    warns = []
+    ws = str(fm.get('workspace', ''))
+    if not ws:
+        return warns
+    root = _repo_root(ws)
+    if not root:
+        return warns
+    forb = ' '.join(str(x).strip() for x in (fm.get('forbidden') or []))
+    if 'hermes-agent' in root:
+        missing = [f for f in _INFRA_PROTECT if f not in forb]
+        if missing:
+            warns.append((0, 'L22',
+                '[FATAL] workspace 是 hermes-agent repo 但 forbidden 沒保護 '
+                f'基礎設施檔：{", ".join(missing)} —— worker 未提交改壞其中任何一個 '
+                '就會讓整條 kanban pipeline 掛掉（2026-08-10 unblock_task NameError）。'
+                'forbidden 必須含以上全部，並配 L10 前後 hash 對照的 verify'))
+    vfy = [str(v) for v in (fm.get('verify') or []) if v]
+    has_status = any(re.search(r'git\s+status\s+--short', v) for v in vfy)
+    if not has_status:
+        warns.append((0, 'L23',
+            f'[FATAL] workspace 是 git repo（{root}）但 verify 沒有一條要求 '
+            '結尾 git status --short 確認乾淨 —— 殘骸（零散測試腳本、垃圾檔）'
+            '必然留在 repo 沒人發現。補一條：「git -C <repo> status --short 檢查，'
+            '不得有任何未提交檔案（除非工單明確要求留檔並列入 files）」'))
+    return warns
+
+
+def lint_verify(fm: dict, out=sys.stderr) -> int:
+    warns = _lint_verify(fm)
+    fm['_lint_score'] = lint_score(warns)
+    fm['_lint_warns'] = warns
+    if not warns:
+        return 0
+    for idx, l, msg in warns:
+        where = f"verify[{idx}]" if idx else "工單"
+        tag = "FATAL" if l in _LINT_FATAL else "WARN"
+        print(f"mdispatch: {tag} {where} {l} {msg}", file=out)
+    return len(warns)
+
+def _parse_dur(s: str) -> int:
+    if s.endswith('s'): return int(s[:-1])
+    if s.endswith('m'): return int(s[:-1]) * 60
+    if s.endswith('h'): return int(s[:-1]) * 3600
+    if s.endswith('d'): return int(s[:-1]) * 86400
+    return int(s)
+
+# ── Validate ──────
+
+def validate(plan_path: str) -> dict:
+    text = Path(plan_path).read_text()
+    fm = _parse_fm(text)
+    for k in ['title','workspace','outcome','files','verify','forbidden','stop_when']:
+        if k not in fm:
+            raise ValueError(f"缺欄位: {k}")
+    if len(fm['title']) > 120:
+        raise ValueError(f"title 太長")
+    if len(str(fm.get('outcome','')).strip()) < 10:
+        raise ValueError("outcome < 10 字")
+    if len(str(fm.get('stop_when','')).strip()) < 10:
+        raise ValueError("stop_when < 10 字")
+    vfy = fm['verify']
+    if not isinstance(vfy,list) or not vfy:
+        raise ValueError("verify  必須 list >=1")
+    for j,v in enumerate(vfy):
+        if not v or not v.strip():
+            raise ValueError(f"verify[{j}] empty")
+        for pat in _VERIFY_DENY:
+            if re.search(pat, v):
+                raise ValueError(f"verify[{j}] 長駐: {v[:60]}")
+    ws = fm['workspace']
+    if ws in ('scratch','worktree'):
+        # L14: 裸值 kanban 端接不住 —— workspace_kind=worktree 但沒有 workspace_path，
+        # board 也沒有 default_workdir，run 會 gave_up 0s 然後降級成空的 scratch 目錄。
+        # t_f7ee404b 就這樣在空目錄裡跑了 4194 秒燒完 120/120，產出只有一個 .pytest_cache。
+        raise ValueError(
+            f"L14 workspace 裸值「{ws}」—— kanban 接不住（無 workspace_path 且 board 無 "
+            f"default_workdir），會降級成空的 scratch 目錄空轉整輪。"
+            f"改成 dir:/絕對路徑 或 worktree:/絕對路徑")
+    elif ws.startswith('worktree:') or ws.startswith('dir:'):
+        d = ws.split(':',1)[1]
+        if not os.path.isdir(d):
+            raise ValueError(f"workspace dir missing: {d}")
+    else:
+        raise ValueError(f"workspace 格式錯: {ws}")
+    gmt = int(fm.get('goal_max_turns', _GT_DEFAULT))
+    if not (_GT_MIN <= gmt <= _GT_MAX):
+        raise ValueError(f"goal_max_turns {gmt} out of range")
+    body_section = text.split("---\n",2)[-1] if text.count("---")>=2 else ""
+    if not re.search(r'^## (Steps|步驟)', body_section, re.MULTILINE):
+        raise ValueError("no ## Steps")
+    fm['_body_md'] = body_section
+    mr = str(fm.get('max_runtime', '')).strip()
+    if mr:
+        try:
+            secs = _parse_dur(mr)
+        except Exception:
+            raise ValueError(f"max_runtime 格式錯: {mr}（用 30m / 90m / 3600s）")
+        if not (300 <= secs <= 10800):
+            raise ValueError(f"max_runtime {mr}  超出範圍（5m ~ 3h）")
+    tch = fm.get('touches')
+    if tch is not None and not isinstance(tch, list):
+        raise ValueError("touches  必須是 list")
+    fm['_sha'] = hashlib.sha256(text.encode()).hexdigest()
+    fm['_path'] = plan_path
+
+    # L15: cross-profile 未授權 —— hard reject，理由見 _lint_cross_profile
+    for _, _l, _msg in _lint_cross_profile(fm):
+        raise ValueError(f"L15 {_msg}")
+
+    # body 上限預檢：以前這個只在 _dispatch 才 RuntimeError，
+    # 等於 lint 全綠、分數印出來了才發現派不出去。提前到這裡並講清楚超多少。
+    _b = build_body(fm)
+    _n = len(_b.encode('utf-8'))
+    if _n > _BODY_CAP:
+        raise ValueError(
+            f"body {_n} bytes 超過上限 {_BODY_CAP}（超 {_n - _BODY_CAP}）—— "
+            f"精簡 verify 條文或把背景搬進 attachment；"
+            f"目前 verify {len(fm.get('verify') or [])} 條")
+    return fm
+
+# ── Body builder ──────
+
+def _extract_steps(body_md: str, budget: int) -> str:
+    if not body_md or budget <= 200:
+        return ""
+    m = re.search(r'^## (?:Steps|步驟).*$', body_md, re.MULTILINE)
+    seg = body_md[m.start():] if m else body_md
+    seg = seg.strip()
+    if not seg:
+        return ""
+    if len(seg.encode('utf-8')) <= budget:
+        return seg
+    kept, used = [], 0
+    tail = "\n\n（步驟過長已截斷，完整版見本任務 attachment 的 md 原檔）"
+    limit = budget - len(tail.encode('utf-8'))
+    for line in seg.split('\n'):
+        b = len(line.encode('utf-8')) + 1
+        if used + b > limit:
+            break
+        kept.append(line)
+        used += b
+    return '\n'.join(kept) + tail
+
+def build_body(fm: dict) -> str:
+    lines = [f"Outcome: {fm['outcome']}"]
+    if fm.get('forbidden') and any(str(x).strip('[]') for x in fm.get('forbidden',[])):
+        lines.append("禁止事項（以下每一條都是「不得做」，做了就是違規）：")
+        for x in fm['forbidden']:
+            lines.append(f"  - 不得：{x}")
+    lines += [
+        f"Stop when blocked: {fm['stop_when']}",
+        "",
+        "## 回報格式（每輪回覆都必須包含）",
+        "對 Verification  每一條指令，貼出：",
+        "    $ <指令原文>",
+        "    <最後 20 行輸出>",
+        "    exit code: <數字>",
+        "只說「已完成」而無實際輸出的回覆一律視為未完成。",
+        "驗收條檢查的是**語意有效**，不是字串存在：湊關鍵字讓 grep 通過但產出不可用，",
+        "一律視為未完成並退回。",
+        "完成後呼叫 kanban_complete，證據放進 summary。",
+    ]
+    for j, v in enumerate(fm['verify']):
+        lines.append(f"Verification {j+1}: {v}")
+    files = fm.get('files', [])
+    if files:
+        lines.append("")
+        lines.append("## Files")
+        for f in files:
+            lines.append(f"- {f}")
+    touches = fm.get('touches') or []
+    if touches:
+        lines.append("")
+        lines.append("## 可改範圍（write-set，只准改這些；其餘 Files 一律唯讀）")
+        for t in touches:
+            lines.append(f"- {t}")
+    base = '\n'.join(lines)
+    steps = _extract_steps(fm.get('_body_md', ''), _BODY_CAP - len(base.encode('utf-8')) - 256)
+    if steps:
+        base = base + "\n\n" + steps
+    return base
+
+# ── Dispatch helpers ──────
+
+def _run_hermes(args):
+    return subprocess.run([_HERMES] + args, capture_output=True, text=True, timeout=30)
+
+def _dispatch(fm: dict, opts) -> Optional[str]:
+    title = fm['title']
+    body = build_body(fm)
+    if len(body.encode('utf-8')) > _BODY_CAP:
+        raise RuntimeError(f"body > {_BODY_CAP} bytes")
+    if opts.dry_run:
+        print("[dry-run] body:", body[:200])
+        print("[dry-run] ...")
+        return None
+    args = [
+        "kanban","create","--json",title,
+        "--body",body,
+        "--assignee",opts.assignee,
+        "--workspace",fm['workspace'],
+        "--goal","--goal-max-turns",str(fm.get('goal_max_turns',_GT_DEFAULT)),
+        "--max-runtime",str(fm.get('max_runtime') or opts.max_runtime),
+        "--max-retries","1",
+        "--initial-status","blocked",
+        "--created-by","claude-code",
+        f"--idempotency-key=mdp-{fm['_sha'][:16]}",
+    ]
+    if opts.model:
+        args += ["--model",opts.model]
+    if opts.provider:
+        args += ["--provider",opts.provider]
+    if opts.project:
+        args += ["--project",opts.project]
+    for s in opts.skills:
+        args += ["--skill",s]
+    r = _run_hermes(args)
+    if r.returncode:
+        print(r.stderr.strip() or r.stdout.strip(), file=sys.stderr)
+        raise RuntimeError("create 失敗")
+    card = json.loads(r.stdout)
+    tid = card["id"]
+    _run_hermes(["kanban","attach",tid,fm['_path']])
+    _run_hermes(["kanban","unblock",tid])
+    if opts.kick:
+        _run_hermes(["kanban","dispatch","--max","1"])
+    return tid
+
+# ── Subcommands ──────
+
+def cmd_check(fm, opts):
+    print(f"OK {fm['title']}")
+    for j,v in enumerate(fm['verify']):
+        print(f"  verify[{j}]: {v}")
+    print(f"  host files: {', '.join(fm['files'])}")
+    print(f"  idem-key=mdp-{fm['_sha'][:16]}")
+    if opts.verify_now:
+        for v in fm['verify']:
+            print(f"\n  $ {v}")
+            r = subprocess.run(v, shell=True, capture_output=True, text=True, timeout=5)
+            out = r.stdout.strip()
+            if out:
+                print("    " + out.replace('\n','\n    '))
+            print(f"    exit code: {r.returncode} " + ("V" if r.returncode==0 else "X"))
+
+def cmd_status(tid, is_json):
+    r = _run_hermes(["kanban","show",tid,"--json"])
+    d = json.loads(r.stdout)
+    t = d.get('task', d)
+    if is_json:
+        print(r.stdout)
+    else:
+        print(f"  id={t['id']} status={t['status']}")
+        if d.get('latest_summary'):
+            print(f"  summary: {d['latest_summary'][:200]}")
+
+def cmd_log(tid, opts):
+    n = opts.tail or 20000
+    subprocess.run([_HERMES,"kanban","log",tid,"--tail",str(n)], check=True)
+
+def _get_task_output(tid: str) -> str:
+    r = subprocess.run([_HERMES, "kanban", "show", tid, "--json"],\
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode == 0:
+        d = json.loads(r.stdout)
+        t = d.get('task', d)
+        summary = t.get('latest_summary', '')
+        if summary and summary.strip():
+            return summary.strip()
+    r2 = subprocess.run([_HERMES, "kanban", "runs", tid, "--json"],\
+                        capture_output=True, text=True, timeout=10)
+    if r2.returncode == 0:
+        try:
+            runs = json.loads(r2.stdout)
+            if runs:
+                last = runs[-1]
+                summary = last.get('summary', '')
+                if summary and summary.strip():
+                    return summary.strip()
+        except json.JSONDecodeError:
+            pass
+    r3 = subprocess.run([_HERMES, "kanban", "log", tid, "--tail", "4000"],\
+                        capture_output=True, text=True, timeout=15)
+    if r3.returncode == 0 and r3.stdout.strip():
+        return r3.stdout.strip()
+    return ""
+
+def cmd_wait(tid, opts):
+    total = _parse_dur(opts.timeout)
+    interval = opts.interval or _INTERVAL_DEFAULT
+    deadline = time.time() + total
+    while time.time() < deadline:
+        r = subprocess.run([_HERMES, "kanban", "show", tid, "--json"],\
+                           capture_output=True, text=True, timeout=10)
+        d = json.loads(r.stdout)
+        t = d.get('task', d)
+        s = t['status']
+        if s in ('done', 'blocked', 'archived', 'cancelled'):
+            if s == 'done':
+                output = _get_task_output(tid)
+                if not output:
+                    print("[mdispatch] task done but produced no output")
+                    sys.exit(4)
+                print(output)
+                print("\nVerification done")
+                sys.exit(0)
+            if s == 'blocked':
+                output = _get_task_output(tid)
+                if not output:
+                    print("[mdispatch] task blocked but produced no output")
+                else:
+                    print(output)
+                sys.exit(3)
+            sys.exit(4)
+        time.sleep(interval)
+    sys.exit(5)
+
+def main():
+    # Handle subcommands before argparse (avoids nargs="?" + subparser conflict)
+    args = sys.argv[1:]
+    if args and args[0] in ('check','status','log','wait'):
+        cmd = args[0]
+        rest = args[1:]
+        _parse_subcommand(cmd, rest)
+        return
+    # Top-level run
+    p = argparse.ArgumentParser(prog="mdispatch")
+    p.add_argument("plan", nargs="?")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--follow", action="store_true")
+    p.add_argument("--kick", action="store_true")
+    p.add_argument("--sync", action="store_true")
+    p.add_argument("--assignee", default=_ASSIGNEE)
+    p.add_argument("--model"); p.add_argument("--provider"); p.add_argument("--project")
+    p.add_argument("--skill", action="append", default=[], dest="skills")
+    p.add_argument("--max-runtime", default=_RUNTIME_DEFAULT)
+    p.add_argument("--min-score", type=int, default=_MIN_SCORE_DEFAULT,
+                   help="lint 品質分數門檻，低於此值拒派（0 = 關閉）")
+    opts = p.parse_args(args)
+    if not opts.plan:
+        p.print_help()
+        sys.exit(2)
+    if opts.sync and opts.follow:
+        print("--sync not compatible with --follow", file=sys.stderr)
+        sys.exit(2)
+    try:
+        fm = validate(plan_path=opts.plan)
+    except (ValueError,KeyError) as e:
+        print(f"X {e}", file=sys.stderr)
+        sys.exit(2)
+    # Lint: 可證偽性 + 覆蓋 + 措辭檢查，加總為品質分數；低於 --min-score 拒派
+    lint_warn_count = lint_verify(fm)
+    score = fm.get('_lint_score', 100)
+    if lint_warn_count:
+        fatal = sum(1 for _, l, _ in fm.get('_lint_warns', []) if l in _LINT_FATAL)
+        tag = 'FATAL' if fatal else 'WARN'
+        print(f"mdispatch: lint 共 {lint_warn_count} 條 {tag}，品質分數 {score}/100"
+              f"（門檻 {opts.min_score}）", file=sys.stderr)
+    if opts.min_score and score < opts.min_score:
+        print(f"X 品質分數 {score} < 門檻 {opts.min_score}，拒派。"
+              f"修掉上列 FATAL / WARN，或明確放行：--min-score 0", file=sys.stderr)
+        sys.exit(2)
+    if opts.sync:
+        body = build_body(fm)
+        r = subprocess.run([_HERMES,"-p",opts.assignee,"--cli","chat","-Q","-q",body],
+                           capture_output=True, text=True, timeout=300)
+        print(r.stdout)
+        if r.returncode:
+            print(r.stderr)
+        sys.exit(r.returncode)
+    else:
+        tid = _dispatch(fm, opts)
+        if opts.dry_run:
+            print("[dry-run] OK — no dispatch")
+        elif tid:
+            print(f"task_id={tid}")
+            if opts.follow:
+                cmd_wait(tid, argparse.Namespace(timeout="15m", interval=_INTERVAL_DEFAULT))
+        else:
+            sys.exit(3)
+
+def _parse_subcommand(cmd, args):
+    if cmd == "check":
+        p = argparse.ArgumentParser(prog="mdispatch check")
+        p.add_argument("plan")
+        p.add_argument("--verify-now", action="store_true")
+        o = p.parse_args(args)
+        try:
+            fm = validate(plan_path=o.plan)
+            lint_warn_count = lint_verify(fm)
+            score = fm.get('_lint_score', 100)
+            if lint_warn_count:
+                fatal = sum(1 for _, l, _ in fm.get('_lint_warns', []) if l in _LINT_FATAL)
+                if fatal:
+                    print(f"mdispatch: lint 共 {lint_warn_count} 條（含 {fatal} 條 FATAL），"
+                          f"品質分數 {score}/100 —— dispatch 會拒派（門檻 {_MIN_SCORE_DEFAULT}）")
+                else:
+                    print(f"mdispatch: lint 共 {lint_warn_count} 條 WARN，"
+                          f"品質分數 {score}/100（不阻擋派工）")
+            cmd_check(fm, o)
+        except (ValueError,KeyError) as e:
+            print(f"X {e}", file=sys.stderr)
+            sys.exit(2)
+    elif cmd == "status":
+        p = argparse.ArgumentParser(prog="mdispatch status")
+        p.add_argument("id")
+        p.add_argument("--json", action="store_true")
+        o = p.parse_args(args)
+        cmd_status(o.id, o)
+    elif cmd == "log":
+        p = argparse.ArgumentParser(prog="mdispatch log")
+        p.add_argument("id")
+        p.add_argument("--tail", type=int, default=20000)
+        o = p.parse_args(args)
+        cmd_log(o.id, o)
+    elif cmd == "wait":
+        p = argparse.ArgumentParser(prog="mdispatch wait")
+        p.add_argument("id")
+        p.add_argument("--timeout", default="15m")
+        p.add_argument("--interval", type=int, default=_INTERVAL_DEFAULT)
+        o = p.parse_args(args)
+        cmd_wait(o.id, o)
+
+if __name__ == "__main__":
+    main()
