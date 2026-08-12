@@ -44,6 +44,22 @@ class TestIsLikelyBinary:
         sample = "\t" * 400 + "\n" * 300 + "\r" * 200 + "a" * 100
         assert ops._is_likely_binary("file.txt", content_sample=sample) is False
 
+    def test_replacement_char_inside_sample_is_binary(self, ops):
+        """U+FFFD mid-sample means undecodable bytes → binary (read-only)."""
+        sample = "text � more text" + "a" * 100
+        assert ops._is_likely_binary("blob.xyz", content_sample=sample) is True
+
+    def test_trailing_replacement_char_from_byte_truncation_is_text(self, ops):
+        """`head -c 1000` can split a multibyte UTF-8 char at the tail,
+        decoding to trailing U+FFFD — truncation artifact, not binary."""
+        sample = ("這是一段正常的繁體中文說明文件。" * 20)[:998] + "�"
+        assert ops._is_likely_binary("plan.md", content_sample=sample) is False
+
+    def test_chinese_markdown_is_text(self, ops):
+        """Multibyte UTF-8 (中文) counts as printable, not binary."""
+        sample = "# 計畫\n\n繁體中文內容，含技術詞 pytest 與路徑 /tmp/x。\n" * 20
+        assert ops._is_likely_binary("doc.md", content_sample=sample) is False
+
     def test_content_sample_longer_than_1000(self, ops):
         """Only the first 1000 characters should be analysed."""
         # First 1000 chars: 200 NUL + 800 printable = 20% → not binary

@@ -635,7 +635,10 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
     soul_path = profile_dir / "SOUL.md"
     hash_file = profile_dir / "memory" / "soul_core.sha256"
 
-    old_text = soul_path.read_text(encoding="utf-8") if soul_path.exists() else ""
+    try:
+        old_text = soul_path.read_text(encoding="utf-8") if soul_path.exists() else ""
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not read SOUL.md: {e}")
     old_core = _extract_core_block(old_text.splitlines(keepends=True))
     new_core = _extract_core_block(body.content.splitlines(keepends=True))
     governed = old_core is not None or hash_file.exists()
@@ -651,19 +654,23 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
             if _core_hash_of(new_core) != expected:
                 raise HTTPException(403, "CORE hash mismatch")
 
-    # Step2 備份（guard 通過後、原檔存在時；全 profile 一致）
-    backup_name = None
-    if soul_path.exists():
-        backup_name = f"SOUL.md.bak.{time.strftime('%Y%m%d-%H%M%S')}"
-        (profile_dir / backup_name).write_text(old_text, encoding="utf-8")
+    try:
+        # Step2 備份（guard 通過後、原檔存在時；全 profile 一致）
+        backup_name = None
+        if soul_path.exists():
+            backup_name = f"SOUL.md.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+            (profile_dir / backup_name).write_text(old_text, encoding="utf-8")
 
-    # Step3 hash 重算（僅 governed）
-    if governed:
-        hash_file.parent.mkdir(parents=True, exist_ok=True)
-        hash_file.write_text(_core_hash_of(new_core) + "\n", encoding="utf-8")
+        # Step3 hash 重算（僅 governed）
+        if governed:
+            hash_file.parent.mkdir(parents=True, exist_ok=True)
+            hash_file.write_text(_core_hash_of(new_core) + "\n", encoding="utf-8")
 
-    # Step4 寫入（保留現有 OSError → 500 + log 分支）
-    soul_path.write_text(body.content, encoding="utf-8")
+        # Step4 寫入
+        soul_path.write_text(body.content, encoding="utf-8")
+    except OSError as e:
+        _log.exception("PUT /api/profiles/%s/soul failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
     return {"ok": True, "backup": backup_name, "core_guard": governed}
 
 

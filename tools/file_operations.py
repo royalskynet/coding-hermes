@@ -899,6 +899,12 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
+            sample = content_sample[:1000]
+            # The sample comes from `head -c 1000` — a byte-level cut that can
+            # split a multibyte UTF-8 char (e.g. 中文) at the tail, decoding to
+            # U+FFFD. That trailing artifact is truncation, not binary; only a
+            # replacement char *inside* the sample means undecodable bytes.
+            sample = sample.rstrip("�")
             # Undecodable bytes: the terminal env decodes stdout with
             # errors="replace", so any non-UTF-8 byte arrives here already
             # turned into U+FFFD. That char is "printable" (ord 65533), so the
@@ -908,11 +914,16 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            if "\ufffd" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
-                               if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            # Multibyte UTF-8 text, including 中文 markdown, is still text.
+            # Only control chars other than tab/newline/CR count toward the
+            # binary heuristic.
+            if sample:
+                non_printable = sum(
+                    1 for c in sample if ord(c) < 32 and c not in '\n\r\t'
+                )
+                return non_printable / len(sample) > 0.30
         
         return False
     

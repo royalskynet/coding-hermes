@@ -202,3 +202,25 @@ def test_put_soul_core_present_but_no_hash_file(client, monkeypatch, tmp_path):
     assert resp.status_code == 200
     assert resp.json()["core_guard"] is True
     assert (tmp_path / "memory" / "soul_core.sha256").exists()
+
+
+def test_put_soul_write_oserror_returns_500(client, monkeypatch, tmp_path):
+    from hermes_cli import web_server
+    from pathlib import Path
+
+    _setup_governed(tmp_path)
+    monkeypatch.setattr(web_server, "_resolve_profile_dir", lambda _n: tmp_path)
+    old_text = (tmp_path / "SOUL.md").read_text(encoding="utf-8")
+
+    original_write_text = Path.write_text
+
+    def fail_on_backup_or_target(self, data, *args, **kwargs):
+        if self == (tmp_path / "SOUL.md") or self.name.startswith("SOUL.md.bak."):
+            raise OSError("disk full")
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_on_backup_or_target)
+    resp = client.put("/api/profiles/test/soul", json={"content": _soul_with_core() + "\n\n## Growth\n"})
+    assert resp.status_code == 500
+    assert "Could not write SOUL.md" in resp.json()["detail"]
+    assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == old_text
