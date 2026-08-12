@@ -645,6 +645,77 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
 
 
 
+# ---------------------------------------------------------------------------
+# Empty-workdir guard (# mannie-coding-optimization Block B)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_workspace_dir_refuses_to_create_nonexistent_path(kanban_home, tmp_path):
+    """A 'dir' workspace pointing at a missing path must raise, not mkdir it.
+
+    Regression for the phantom empty workdir: a project whose ``primary_path``
+    no longer exists used to be silently re-materialised by
+    ``resolve_workspace``'s unconditional ``mkdir``, leaving an empty dir
+    where a real checkout should live (workers flailing inside it, e.g.
+    "venv has no pytest").
+    """
+    missing = tmp_path / "no-such-project" / "workdir"
+    assert not missing.exists()
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="dir phantom",
+            workspace_kind="dir",
+            workspace_path=str(missing),
+        )
+        task = kb.get_task(conn, t)
+        with pytest.raises(ValueError, match="does not exist"):
+            kb.resolve_workspace(task)
+    assert not missing.exists(), "must not be created"
+
+
+def test_resolve_workspace_dir_still_creates_explicit_existing_parent(kanban_home, tmp_path):
+    """A real 'dir' path (parent exists) still resolves and is not deleted.
+
+    Positive control so the new existence guard does not break the normal
+    persistent-workspace path.
+    """
+    existing = tmp_path / "real-project"
+    existing.mkdir()
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="dir real",
+            workspace_kind="dir",
+            workspace_path=str(existing),
+        )
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+    assert ws == existing
+    assert ws.exists()
+
+
+def test_create_task_does_not_inherit_nonexistent_board_default_workdir(kanban_home, tmp_path):
+    """A board whose ``default_workdir`` points at a missing path must not inherit it.
+
+    When the board-level ``default_workdir`` no longer exists, a new dir task
+    must fall through without adopting the dangling path (which the empty-
+    workdir guard would otherwise reject at ``resolve_workspace`` time).
+    """
+    missing = tmp_path / "vanished-project"
+    assert not missing.exists()
+    kb.write_board_metadata(None, default_workdir=str(missing))
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="dir no-inherit",
+            workspace_kind="dir",
+        )
+        task = kb.get_task(conn, t)
+        assert task.workspace_path is None, "dangling default_workdir must not be inherited"
+
+
 
 def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
     """Hermes' own DB/metadata/log subtrees under ``<kanban_home>/kanban`` are NOT managed.

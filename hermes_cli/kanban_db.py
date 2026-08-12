@@ -3150,8 +3150,15 @@ def create_task(
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
-        if board_default:
+        if board_default and Path(board_default).expanduser().is_dir():
             workspace_path = str(board_default)
+        elif board_default:
+            _log.warning(
+                "board %s default_workdir %s does not exist; not "
+                "inheriting it as the task workspace",
+                board_slug,
+                board_default,
+            )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -4418,7 +4425,16 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_claimed",
+        task_id,
+        board=get_current_board(),
+        assignee=claimed.assignee if claimed else None,
+        run_id=run_id,
+        source_status="review",
+    )
+    return claimed
 
 
 def heartbeat_claim(
@@ -6658,6 +6674,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"task {task.id} has non-absolute workspace_path "
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
+            )
+        if not p.exists():
+            raise ValueError(
+                f"workspace_path does not exist: {p} — refusing to create an empty workdir"
             )
         p.mkdir(parents=True, exist_ok=True)
         return p
@@ -9779,6 +9799,60 @@ def list_notify_subs(
             )
         out.append(item)
     return out
+
+
+def emit_long_running_events(
+    conn: sqlite3.Connection,
+    *,
+    threshold_seconds: int = 900,
+) -> int:
+    """Append one `long_running` event per active run after the threshold.
+
+    Dedupe key is `(task_id, run_id, kind='long_running')`, so repeated
+    dispatcher ticks do not spam subscribers for the same run.
+    """
+    now = int(time.time())
+    threshold = max(1, int(threshold_seconds))
+    emitted = 0
+    rows = conn.execute(
+        """
+        SELECT id, title, assignee, started_at, last_heartbeat_at, current_run_id
+          FROM tasks
+         WHERE status = 'running'
+           AND current_run_id IS NOT NULL
+           AND COALESCE(last_heartbeat_at, started_at, 0) > 0
+           AND (? - COALESCE(last_heartbeat_at, started_at, 0)) >= ?
+        """,
+        (now, threshold),
+    ).fetchall()
+    if not rows:
+        return 0
+    with write_txn(conn):
+        for row in rows:
+            run_id = int(row["current_run_id"])
+            exists = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'long_running' LIMIT 1",
+                (row["id"], run_id),
+            ).fetchone()
+            if exists:
+                continue
+            touched_at = row["last_heartbeat_at"] or row["started_at"] or now
+            elapsed = max(0, now - int(touched_at))
+            _append_event(
+                conn,
+                row["id"],
+                "long_running",
+                {
+                    "run_id": run_id,
+                    "threshold_seconds": threshold,
+                    "elapsed_seconds": elapsed,
+                    "title": row["title"],
+                    "assignee": row["assignee"],
+                },
+                run_id=run_id,
+            )
+            emitted += 1
+    return emitted
 
 
 def count_notify_subs(

@@ -256,6 +256,40 @@ class TestProfileBootstrap:
 
 
 # ---------------------------------------------------------------------------
+# apply_subprocess_home_env() single-owner HERMES_HOME injection
+# ---------------------------------------------------------------------------
+
+class TestApplySubprocessHomeEnvHERMESHOME:
+    """apply_subprocess_home_env() must always set HERMES_HOME.
+
+    Regression for #18594: HERMES_HOME was only injected when a context
+    override existed. A sticky profile with no explicit env var dropped it,
+    so child processes fell back to the default profile home and wrote state
+    to the wrong place.
+    """
+
+    def _clear_override(self):
+        hermes_constants._HERMES_HOME_OVERRIDE.set(None)
+
+    def test_injects_hermes_home_when_env_and_override_unset(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        self._clear_override()
+        env: dict[str, str] = {}
+        from hermes_constants import apply_subprocess_home_env, get_process_hermes_home
+        apply_subprocess_home_env(env)
+        assert env["HERMES_HOME"] == str(get_process_hermes_home())
+        assert "/.hermes" in env["HERMES_HOME"] or env["HERMES_HOME"]
+
+    def test_does_not_clobber_explicitly_pinned_hermes_home(self, monkeypatch):
+        """setdefault: an existing HERMES_HOME wins over the process default."""
+        pinned = "/tmp/pinned/hermes"
+        env = {"HERMES_HOME": pinned}
+        from hermes_constants import apply_subprocess_home_env
+        apply_subprocess_home_env(env)
+        assert env["HERMES_HOME"] == pinned
+
+
+# ---------------------------------------------------------------------------
 # Python process HOME unchanged
 # ---------------------------------------------------------------------------
 

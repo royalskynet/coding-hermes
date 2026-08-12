@@ -937,6 +937,12 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
     home = get_subprocess_home(env)
     if home:
         env["HOME"] = home
+    # Single owner for HERMES_HOME: every subprocess we spawn gets the
+    # process's resolved Hermes home unless the caller already pinned one.
+    # Previously this was injected only when a context override existed;
+    # a sticky profile with no explicit env var dropped it, and the child
+    # fell back to the default profile home.
+    env.setdefault("HERMES_HOME", str(get_process_hermes_home()))
 
 
 VALID_REASONING_EFFORTS = (
