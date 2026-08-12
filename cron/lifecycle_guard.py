@@ -262,7 +262,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte in a
+        # path tokenized out of a decoded binary's contents (#76762, second
+        # crash point: venv/bin/python decoded as a script feeds junk paths
+        # into os.open). A guarded path must never crash the guard.
         return None, False
     try:
         metadata = os.fstat(descriptor)

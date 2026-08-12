@@ -695,6 +695,61 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_venv_python_pytest_with_remote_script_does_not_crash(self, tmp_path):
+        """#76762 (second crash point): a venv interpreter invoked as
+        `venv/bin/python -m pytest ...` must not crash the guard.
+
+        In the gateway, the local read of the venv binary returns None
+        (NUL bytes -> "nothing to scan"), so the guard falls back to
+        read_remote_script, which decodes the binary's machine code with
+        errors='replace'. That garbage re-tokenizes into paths containing
+        embedded NUL bytes; _read_referenced_script's os.open() then raised
+        ValueError: embedded null byte because only OSError was caught.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        # Simulate the gateway's _read_script_in_env feeding back a decode of
+        # the venv binary (machine code with NUL bytes +/- readable tokens).
+        binary_junk = (
+            b"#!/bin/sh\x00\x00\x00\x7fELF\x00\x00hermes gateway\x00restart\x00"
+            b"\x00\x00\x00\x00\x00\x00 localhost\x00"
+        ).decode("utf-8", errors="replace")
+        calls = []
+
+        def read_remote(script_path):
+            calls.append(script_path)
+            return binary_junk
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "venv/bin/python -m pytest tests/gateway/test_x.py -q",
+            cwd=str(tmp_path),
+            read_remote_script=read_remote,
+        )
+        assert result is False
+        assert calls  # the remote read was actually consulted
+
+    def test_read_referenced_script_null_byte_path_does_not_crash(self, tmp_path):
+        """_read_referenced_script must tolerate a path with an embedded NUL
+        byte (produced by tokenizing decoded binary junk) without raising
+        ValueError: embedded null byte from os.open."""
+        from cron.lifecycle_guard import _read_referenced_script
+        from pathlib import Path
+
+        asserted = False
+        try:
+            text, unsafe = _read_referenced_script(Path("bad\x00path.sh"))
+        except ValueError:
+            assert False, "os.open raised ValueError for embedded NUL path"
+        else:
+            # A NUL path cannot be opened; expect the OSError/ValueError path
+            # to return (None, False) rather than raise.
+            assert text is None
+            assert unsafe is False
+            asserted = True
+        assert asserted
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
