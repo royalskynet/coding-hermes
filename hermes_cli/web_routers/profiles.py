@@ -13,6 +13,7 @@ late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 """
 
 import asyncio  # noqa: F401 — used by handlers
+import hashlib
 import logging
 import subprocess  # noqa: F401
 import sys  # noqa: F401
@@ -590,6 +591,33 @@ async def delete_profile_endpoint(name: str):
     return {"ok": True, "path": str(path)}
 
 
+_CORE_BEGIN_MARK = "CORE:BEGIN"
+_CORE_END_MARK = "CORE:END"
+
+
+def _find_marker_line(lines, marker):
+    # substring match — 與 koko weekly_retro._find_marker_line 一致
+    for i, l in enumerate(lines):
+        if marker in l:
+            return i
+    return None
+
+
+def _extract_core_block(lines):
+    """sed -n '/CORE:BEGIN/,/CORE:END/p' 語意：含 marker 行、不 strip。
+    權威：profiles/koko/cron/weekly_retro.py::extract_core_block —— 不得漂移，
+    漂移後果：web 寫入把 soul_core.sha256 寫成 weekly_retro 永遠對不上的值（fixindex 0382）。"""
+    s = _find_marker_line(lines, _CORE_BEGIN_MARK)
+    e = _find_marker_line(lines, _CORE_END_MARK)
+    if s is None or e is None or e < s:
+        return None
+    return "".join(lines[s:e + 1])
+
+
+def _core_hash_of(core_block):
+    return hashlib.sha256(core_block.encode("utf-8")).hexdigest()
+
+
 @router.get("/api/profiles/{name}/soul")
 async def get_profile_soul(name: str):
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
@@ -603,13 +631,40 @@ async def get_profile_soul(name: str):
 
 @router.put("/api/profiles/{name}/soul")
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
-    soul_path = _resolve_profile_dir(name) / "SOUL.md"
-    try:
-        soul_path.write_text(body.content, encoding="utf-8")
-    except OSError as e:
-        _log.exception("PUT /api/profiles/%s/soul failed", name)
-        raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
-    return {"ok": True}
+    profile_dir = _resolve_profile_dir(name)
+    soul_path = profile_dir / "SOUL.md"
+    hash_file = profile_dir / "memory" / "soul_core.sha256"
+
+    old_text = soul_path.read_text(encoding="utf-8") if soul_path.exists() else ""
+    old_core = _extract_core_block(old_text.splitlines(keepends=True))
+    new_core = _extract_core_block(body.content.splitlines(keepends=True))
+    governed = old_core is not None or hash_file.exists()
+
+    # Step1 guard：先於任何寫入/備份 → 被拒不留垃圾備份
+    if governed:
+        if new_core is None:
+            raise HTTPException(403, "CORE block missing or removed")
+        if old_core is not None and new_core != old_core:
+            raise HTTPException(403, "CORE block modified")
+        if hash_file.exists():
+            expected = hash_file.read_text(encoding="utf-8").strip()
+            if _core_hash_of(new_core) != expected:
+                raise HTTPException(403, "CORE hash mismatch")
+
+    # Step2 備份（guard 通過後、原檔存在時；全 profile 一致）
+    backup_name = None
+    if soul_path.exists():
+        backup_name = f"SOUL.md.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+        (profile_dir / backup_name).write_text(old_text, encoding="utf-8")
+
+    # Step3 hash 重算（僅 governed）
+    if governed:
+        hash_file.parent.mkdir(parents=True, exist_ok=True)
+        hash_file.write_text(_core_hash_of(new_core) + "\n", encoding="utf-8")
+
+    # Step4 寫入（保留現有 OSError → 500 + log 分支）
+    soul_path.write_text(body.content, encoding="utf-8")
+    return {"ok": True, "backup": backup_name, "core_guard": governed}
 
 
 @router.put("/api/profiles/{name}/description")
