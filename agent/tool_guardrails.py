@@ -384,6 +384,21 @@ class ToolCallGuardrailController:
                 return decision
 
             if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
+                # If this is a kanban worker, treat repeated exact failure as a halt and emit findings summary.
+                import os
+                if os.getenv("HERMES_KANBAN_TASK"):
+                    return ToolGuardrailDecision(
+                        action="halt",
+                        code="kanban_findings_summary",
+                        message=(
+                            f"Repeated failure of {tool_name} detected in kanban task. "
+                            "Generating findings summary and halting further retries."
+                        ),
+                        tool_name=tool_name,
+                        count=exact_count,
+                        signature=signature,
+                    )
+                # Default behavior: emit a warning.
                 return ToolGuardrailDecision(
                     action="warn",
                     code="repeated_exact_failure_warning",

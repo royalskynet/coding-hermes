@@ -1336,7 +1336,7 @@ def _handle_create(args: dict, **kw) -> str:
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
-    """Auto-subscribe the calling session to task completion / block events.
+    """Auto-subscribe the calling session to task lifecycle notifications.
 
     Returns True if a subscription row was written, False otherwise (no
     session context, config gate disabled, or best-effort failure). The
@@ -1450,6 +1450,17 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             notifier_profile=notifier_profile,
             delivery_metadata=delivery_metadata or None,
         )
+        task = _kb.get_task(conn, task_id)
+        if task and (task.assignee or "").strip().lower() == "mannie":
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="7852197786",
+                chat_type="dm",
+                notifier_profile="main",
+                delivery_metadata={"chat_type": "dm"},
+            )
         return True
     except Exception as _exc:
         logger.warning(

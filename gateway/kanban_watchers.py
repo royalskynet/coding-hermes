@@ -155,7 +155,21 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        TERMINAL_KINDS = (
+            "claimed",
+            "heartbeat",
+            "long_running",
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "status",
+            "review",
+            "archived",
+            "unblocked",
+            "block_loop_detected",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -458,11 +472,36 @@ class GatewayKanbanWatchersMixin:
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "claimed":
+                            source_status = ""
+                            if ev.payload and ev.payload.get("source_status"):
+                                source_status = str(ev.payload["source_status"])
+                            prefix = "開始驗收" if source_status == "review" else "開始任務"
+                            msg = f"🚀 {board_tag}{tag}Kanban {sub['task_id']} {prefix} — {title}"
+                        elif kind == "heartbeat":
+                            note = ""
+                            if ev.payload and ev.payload.get("note"):
+                                note = f"\n{str(ev.payload['note'])[:200]}"
+                            msg = f"🟡 {board_tag}{tag}Kanban {sub['task_id']} 執行中 — {title}{note}"
+                        elif kind == "long_running":
+                            elapsed = None
+                            if ev.payload and ev.payload.get("elapsed_seconds") is not None:
+                                try:
+                                    elapsed = int(ev.payload["elapsed_seconds"])
+                                except (TypeError, ValueError):
+                                    elapsed = None
+                            elapsed_text = f"（已 {elapsed // 60} 分鐘）" if elapsed and elapsed >= 60 else ""
+                            msg = f"⏰ {board_tag}{tag}Kanban {sub['task_id']} 執行超時提醒 {elapsed_text} — {title}"
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                            if new_status == "review":
+                                msg = f"🧪 {board_tag}{tag}Kanban {sub['task_id']} 待驗收 — {title}"
+                            else:
+                                msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind == "review":
+                            msg = f"🧪 {board_tag}{tag}Kanban {sub['task_id']} 待驗收 — {title}"
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a

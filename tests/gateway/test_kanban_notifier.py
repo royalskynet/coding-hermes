@@ -49,6 +49,9 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {}
+    runner._authorization_adapter = lambda plat, profile=None: adapter
     # Most tests model the default gateway after its dispatcher acquired the
     # singleton lock. Tests for startup or non-owner gateways clear this.
     runner._kanban_dispatcher_lock_handle = object()
@@ -467,6 +470,50 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     # The good task must still be delivered despite the bad task failing.
     assert len(adapter.sent) == 1
     assert tid_good in adapter.sent[0]["text"]
+
+
+def test_notifier_delivers_claimed_long_running_and_review_lifecycle_pings(tmp_path, monkeypatch):
+    db_path = tmp_path / "lifecycle-pings.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="lifecycle task", assignee="mannie")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            notifier_profile="default",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, last_heartbeat_at = ?, current_run_id = COALESCE(current_run_id, 1) WHERE id = ?",
+            (1, 1, tid),
+        )
+        emitted = kb.emit_long_running_events(conn, threshold_seconds=1)
+        assert emitted == 1
+        kb._append_event(
+            conn,
+            tid,
+            "review",
+            {"status": "review"},
+            run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [item["text"] for item in adapter.sent]
+    assert any("開始任務" in text for text in texts)
+    assert any("執行超時提醒" in text for text in texts)
+    assert any("待驗收" in text for text in texts)
 
 
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
