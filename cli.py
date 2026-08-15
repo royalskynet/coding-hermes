@@ -18170,6 +18170,12 @@ def main(
     
     # Handle query shorthand
     query = query or q
+    # Support "-q -" reading query from piped stdin (non-interactive callers
+    # like llm_fallback.py feed large prompts here to stay under ARG_MAX).
+    # Only when the value is literally "-" and we're not sitting at a TTY,
+    # otherwise a literal "-" would be sent to the model as the query.
+    if query == "-" and not sys.stdin.isatty():
+        query = sys.stdin.read()
     
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
