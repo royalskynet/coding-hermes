@@ -713,14 +713,13 @@ class TestConfigSupportFloor:
         "agent": {"verify_on_stop": True},
     }
     _V12_EXPECTED = {
-        "_config_version": 33,
+        "_config_version": 34,
         "agent": {"verify_on_stop": False},
         "auxiliary": {"compression": {"model": "gpt-x"}},
         "compression": {},
         "delegation": {"max_concurrent_children": 8},
         "display": {
             "platforms": {"telegram": {"tool_progress": "verbose"}},
-            "tool_progress_overrides": {"telegram": "verbose"},
         },
         "memory": {"write_approval": True},
         "model": {"default": "openai/gpt-5.4", "provider": "openrouter"},
@@ -972,6 +971,52 @@ class TestInterimAssistantMessageConfig:
         # was the config-bloat bug). It is still effective via load_config().
         assert "interim_assistant_messages" not in raw.get("display", {})
         assert loaded["display"]["interim_assistant_messages"] is True
+
+
+class TestToolProgressOverridesRemovalMigration:
+    """v33→34 drops the legacy display.tool_progress_overrides key."""
+
+    def _run_from_v33(self, tmp_path, display):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"_config_version": 33, "display": display}),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            return yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    def test_empty_overrides_key_is_removed(self, tmp_path):
+        """An empty tool_progress_overrides dict (the six shipped configs'
+        shape) must be deleted, not left to warn forever."""
+        raw = self._run_from_v33(tmp_path, {"tool_progress_overrides": {}})
+        assert "tool_progress_overrides" not in raw["display"]
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+
+    def test_nonempty_overrides_are_folded_then_key_removed(self, tmp_path):
+        """Non-empty overrides are folded into display.platforms (idempotent
+        with the v16 write) and the legacy key is removed."""
+        raw = self._run_from_v33(
+            tmp_path,
+            {
+                "tool_progress_overrides": {"telegram": "off"},
+                "platforms": {"telegram": {"tool_progress": "off"}},
+            },
+        )
+        assert "tool_progress_overrides" not in raw["display"]
+        # platform value preserved (v16 wrote it; v34 must not clobber)
+        assert raw["display"]["platforms"]["telegram"]["tool_progress"] == "off"
+
+    def test_no_display_key_is_noop(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"_config_version": 33}),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
 
 
 class TestCliRefreshIntervalConfig:

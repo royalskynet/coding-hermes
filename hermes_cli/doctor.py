@@ -2072,16 +2072,38 @@ def run_doctor(args):
                         f"({vuln_detail})"
                     )
                     if audit_extra and audit_extra[0] == "--workspace":
-                        # The web/ui-tui workspace advisories are in build-time
-                        # tooling (esbuild/vite, etc.), not runtime code that ships
-                        # to users. Manual npm remediation may error with a known
-                        # arborist crash (edgesOut / isDescendantOf) on this monorepo
-                        # tree — in that case it is an npm bug, not a Hermes one.
-                        check_info(
-                            "  ^ build-time tooling (not runtime); if manual npm remediation "
-                            "errors with an arborist crash it's a known npm bug — clears "
-                            "via a lockfile bump"
-                        )
+                        # A workspace advisory can be either build-time tooling
+                        # (esbuild/vite/etc.) or a DIRECT runtime dependency of
+                        # the workspace (e.g. undici in ui-tui). npm's report
+                        # marks the latter with isDirect=true; only those are
+                        # safe to characterize as build-time.
+                        _direct_runtime = [
+                            name
+                            for name, info in (
+                                audit_data.get("vulnerabilities") or {}
+                            ).items()
+                            if isinstance(info, dict) and info.get("isDirect")
+                        ]
+                        if _direct_runtime:
+                            check_warn(
+                                f"  ^ DIRECT runtime dependency affected: "
+                                f"{', '.join(sorted(_direct_runtime))} — "
+                                "upgrade via package.json dependency/override "
+                                "then regenerate the lockfile"
+                            )
+                        else:
+                            # The web/ui-tui workspace advisories are in
+                            # build-time tooling (esbuild/vite, etc.), not
+                            # runtime code that ships to users. Manual npm
+                            # remediation may error with a known arborist
+                            # crash (edgesOut / isDescendantOf) on this
+                            # monorepo tree — in that case it is an npm bug,
+                            # not a Hermes one.
+                            check_info(
+                                "  ^ build-time tooling (not runtime); if manual npm remediation "
+                                "errors with an arborist crash it's a known npm bug — clears "
+                                "via a lockfile bump"
+                            )
                     issues.append(
                         f"{label} has {total} npm "
                         f"{'vulnerability' if total == 1 else 'vulnerabilities'}"
@@ -2737,7 +2759,10 @@ def run_doctor(args):
                         if "hermes -p" in content:
                             _m = _re.search(r"hermes -p (\S+)", content)
                             if _m and not profile_exists(_m.group(1)):
-                                check_warn(f"Orphan alias: {wrapper.name} → profile '{_m.group(1)}' no longer exists")
+                                check_warn(
+                                    f"Orphan alias: {wrapper.name} → profile '{_m.group(1)}' no longer exists "
+                                    f"(remove with `hermes profile alias {wrapper.name} --remove`)"
+                                )
                     except Exception:
                         pass
     except ImportError:

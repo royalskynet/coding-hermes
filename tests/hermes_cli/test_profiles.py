@@ -455,6 +455,66 @@ class TestWrapperScript:
         assert not wrapper.exists()
 
 
+class TestCmdProfileAliasRemoveOrphan:
+    """``hermes profile alias NAME --remove`` must work for orphan aliases.
+
+    Regression: cmd_profile() checked ``profile_exists()`` BEFORE the
+    --remove branch, so an alias whose profile had been deleted could
+    never be cleaned up via the CLI — doctor's "Orphan alias" warning had
+    no sanctioned fix path. Removal must bypass the existence gate.
+    """
+
+    def test_remove_bypasses_missing_profile(self, profile_env, monkeypatch, capsys):
+        from types import SimpleNamespace
+
+        import hermes_cli.main as main_module
+
+        removed: list = []
+
+        def _fake_remove(name: str) -> bool:
+            removed.append(name)
+            return True
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists", lambda name: False
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.remove_wrapper_script", _fake_remove
+        )
+
+        args = SimpleNamespace(
+            profile_action="alias",
+            profile_name="ghost",
+            alias_name=None,
+            remove=True,
+        )
+        # May raise SystemExit if the gate mis-fires; that must not happen.
+        main_module.cmd_profile(args)
+        assert removed == ["ghost"]
+        out = capsys.readouterr().out
+        assert "Removed alias 'ghost'" in out
+
+    def test_remove_still_requires_valid_name(self, profile_env, monkeypatch, capsys):
+        """Path-traversal names are still refused even for removal."""
+        from types import SimpleNamespace
+
+        import hermes_cli.main as main_module
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.remove_wrapper_script",
+            lambda name: (_ for _ in ()).throw(AssertionError("must not run")),
+        )
+        args = SimpleNamespace(
+            profile_action="alias",
+            profile_name="../escape",
+            alias_name=None,
+            remove=True,
+        )
+        with pytest.raises(SystemExit) as exc:
+            main_module.cmd_profile(args)
+        assert exc.value.code == 1
+
+
 
 
 

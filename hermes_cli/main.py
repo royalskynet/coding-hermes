@@ -9585,10 +9585,6 @@ def cmd_profile(args):
 
         from hermes_cli.profiles import profile_exists, validate_alias_name
 
-        if not profile_exists(name):
-            print(f"Error: Profile '{name}' does not exist.")
-            sys.exit(1)
-
         alias_name = custom_name or name
 
         try:
@@ -9598,11 +9594,20 @@ def cmd_profile(args):
             sys.exit(1)
 
         if remove:
+            # Removal must work even when the target profile no longer
+            # exists (orphan wrappers): `hermes profile alias foo --remove`
+            # is the sanctioned way to clean up an orphan. Validate the
+            # alias name first (as above) so remove_wrapper_script only
+            # ever sees a safe name.
             if remove_wrapper_script(alias_name):
                 print(f"✓ Removed alias '{alias_name}'")
             else:
                 print(f"No alias '{alias_name}' found to remove.")
         else:
+            if not profile_exists(name):
+                print(f"Error: Profile '{name}' does not exist.")
+                sys.exit(1)
+
             collision = check_alias_collision(alias_name)
             if collision:
                 print(f"Error: {collision}")

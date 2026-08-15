@@ -644,6 +644,47 @@ def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 33 → 34: drop legacy display.tool_progress_overrides ──
+    # v16 migrated non-empty tool_progress_overrides into
+    # display.platforms.*.tool_progress but (a) skipped EMPTY dicts (the
+    # `and old_overrides:` guard) and (b) never removed the old key, so the
+    # deprecated-key warning sticks forever. Fold any leftover values
+    # (idempotent with the v16 write: only fills plats lacking a
+    # tool_progress entry) then delete the key unconditionally. Runtime
+    # back-compat in gateway/display_config.py still honors the legacy key
+    # only as a fallback, so removing an empty leftover is zero behavior
+    # change.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    display = config.get("display")
+    if not isinstance(display, dict) or "tool_progress_overrides" not in display:
+        return
+    old_overrides = display.get("tool_progress_overrides")
+    if isinstance(old_overrides, dict) and old_overrides:
+        platforms = display.get("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+        for plat, mode in old_overrides.items():
+            if plat not in platforms:
+                platforms[plat] = {}
+            if "tool_progress" not in platforms[plat]:
+                platforms[plat]["tool_progress"] = mode
+        display["platforms"] = platforms
+        if not quiet:
+            migrated = ", ".join(f"{p}={m}" for p, m in old_overrides.items())
+            print(f"  ✓ Migrated tool_progress_overrides → display.platforms: {migrated}")
+    del display["tool_progress_overrides"]
+    config["display"] = display
+    _persist_migration(config)
+    results["config_added"].append("display.tool_progress_overrides (removed, deprecated)")
+    if not quiet:
+        print("  ✓ Removed deprecated display.tool_progress_overrides")
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may
@@ -665,6 +706,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (31, _migrate_to_31),
     (32, _migrate_to_32),
     (33, _migrate_to_33),
+    (34, _migrate_to_34),
 )
 
 
