@@ -10,7 +10,16 @@ from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
     PATCH_SCHEMA,
+    READ_FILE_SCHEMA,
 )
+
+
+def test_read_file_schema_requires_evidence_before_binary_classification():
+    description = READ_FILE_SCHEMA["description"]
+
+    assert "Treat a path as binary only" in description
+    assert "file --brief --mime <path>" in description
+    assert "not a binary classification" in description
 
 
 class TestReadFileHandler:

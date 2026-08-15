@@ -1057,7 +1057,7 @@ import sys
 # Tool description for LLM
 TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
 
-Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
+For ordinary text reads, prefer read_file over cat/head/tail; use search_files instead of grep/rg/find/ls, patch instead of sed/awk, and write_file instead of echo/heredoc creation. This is a tool-use preference, never evidence that a file is binary. When a specific path may be binary, determine its type from read_file's actual result or inspect that path with `file --brief --mime`; do not infer binary status from this guidance, a filename, or a read failure. Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.

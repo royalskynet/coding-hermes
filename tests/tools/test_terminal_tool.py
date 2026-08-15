@@ -30,6 +30,14 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "once per session" in description
 
 
+def test_terminal_schema_requires_evidence_before_binary_classification():
+    description = terminal_tool.TERMINAL_TOOL_DESCRIPTION
+
+    assert "never evidence that a file is binary" in description
+    assert "file --brief --mime" in description
+    assert "do not infer binary status" in description
+
+
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
