@@ -3716,42 +3716,6 @@ def run_job(
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
 
-        # ── Koko secretary-voice guard ──────────────────────────────────────
-        # Only fires when running under the koko profile.  Checks the final
-        # LLM output against secretary_guard._passes_secretary_voice() before
-        # delivery.  Rejected messages are dropped (SILENT_MARKER) and logged
-        # to ~/.hermes/profiles/koko/logs/voice-reject.log with timestamp +
-        # first 200 chars + reason.  LLM judge failures conservatively pass.
-        if final_response and _get_hermes_home().name == "koko":
-            try:
-                import sys as _sys
-                _guard_dir = str(_get_hermes_home() / "cron")
-                if _guard_dir not in _sys.path:
-                    _sys.path.insert(0, _guard_dir)
-                from secretary_guard import _passes_secretary_voice
-                if not _passes_secretary_voice(final_response):
-                    import datetime as _dt
-                    _ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    _log_path = _get_hermes_home() / "logs" / "voice-reject.log"
-                    _log_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(_log_path, "a", encoding="utf-8") as _lf:
-                        _lf.write(
-                            f"[{_ts}] job={job_name!r} reason=secretary_guard_blocked "
-                            f"text={final_response[:200]!r}\n"
-                        )
-                    logger.info(
-                        "Job '%s': koko secretary guard blocked output — skipping delivery",
-                        job_name,
-                    )
-                    final_response = SILENT_MARKER
-                    logged_response = SILENT_MARKER
-            except Exception as _sg_exc:
-                logger.warning(
-                    "Job '%s': secretary_guard check failed (non-fatal, passing): %s",
-                    job_name, _sg_exc,
-                )
-        # ────────────────────────────────────────────────────────────────────
-
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -4013,7 +3977,90 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # / empty-response computation, or _deliver_result itself — raises, the
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
+        # ── Koko secretary-voice guard (structured verdict, Round 4) ──────
+        # Only fires when running under the koko profile.  Calls
+        # secretary_guard._align_with_secretary_persona() which returns a
+        # structured verdict:
+        #   allow        → deliver original text
+        #   rewrite      → deliver LLM-adjusted text (guard_rewritten)
+        #   block/regen  → skip delivery (SILENT_MARKER), verdict trail in
+        #                  logs/voice-reject.jsonl; delivery_error stays None so
+        #                  delivery stats report suppressed, not failed
+        #   guard_error  → LLM judge failure: fail-open (deliver original),
+        #                  still logged so Round 5 can audit the error rate
+        # Every verdict is appended to logs/voice-reject.jsonl (one JSON per
+        # line) so the weekly audit has allow/rewrite/block/guard_error counts.
+        job_name = job.get("name", job["id"])
+        _guard_state = "produced"
+        if final_response and _get_hermes_home().name == "koko":
+            try:
+                import sys as _sys
+                _guard_dir = str(_get_hermes_home() / "cron")
+                if _guard_dir not in _sys.path:
+                    _sys.path.insert(0, _guard_dir)
+                from secretary_guard import _align_with_secretary_persona as _guard_align
+                _gv = _guard_align(final_response)
+                _verdict = _gv.get("verdict", "allow")
+                _category = _gv.get("category")
+                _reason = _gv.get("reason")
+                _judge_raw = (_gv.get("judge_raw") or "")[:500]
+                _model = _gv.get("model")
+                _latency_ms = _gv.get("latency_ms", 0)
+                _orig_text = _gv.get("original", final_response)
+                _final_text = _gv.get("text") or final_response
+                _log_path = _get_hermes_home() / "logs" / "voice-reject.jsonl"
+                _log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(_log_path, "a", encoding="utf-8") as _lf:
+                    _lf.write(json.dumps({
+                        "ts": _hermes_now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "job": job_name,
+                        "verdict": _verdict,
+                        "category": _category,
+                        "reason": _reason,
+                        "judge_raw": _judge_raw,
+                        "model": _model,
+                        "latency_ms": _latency_ms,
+                        "text": _orig_text,
+                        "final_text": _final_text if _verdict == "rewrite" else None,
+                    }, ensure_ascii=False) + "\n")
+                if _verdict in ("block", "regen"):
+                    _guard_state = "guard_blocked"
+                    logger.info(
+                        "Job '%s': koko secretary guard %s%s — skipping delivery",
+                        job_name, _verdict, f" ({_category})" if _category else "",
+                    )
+                    final_response = SILENT_MARKER
+                elif _verdict == "rewrite":
+                    _guard_state = "guard_rewritten"
+                    final_response = _final_text
+                    logger.info("Job '%s': koko secretary guard rewrote output", job_name)
+                else:
+                    # allow / guard_error → fail-open original text
+                    _guard_state = "produced" if _verdict == "allow" else "guard_error"
+                    logger.info(
+                        "Job '%s': koko secretary guard %s%s",
+                        job_name, _verdict,
+                        f" ({_reason})" if _reason else "",
+                    )
+            except Exception as _sg_exc:
+                _guard_state = "guard_failed"
+                logger.warning(
+                    "Job '%s': secretary_guard check failed (non-fatal, passing): %s",
+                    job_name, _sg_exc,
+                )
+        # ────────────────────────────────────────────────────────────────────
         delivery_error = None
+        # Guard block/rewrite: the delivered `final_response` differs from the
+        # still-raw `output` saved by save_job_output. Re-sync the `## Response`
+        # section so the on-disk output file reflects what was actually
+        # delivered instead of leaking the pre-guard original. Use partition on
+        # the section marker (not output.replace) so a like-for-like occurrence
+        # inside the prompt/tool transcript isn't clobbered by mistake.
+        if _guard_state in ("guard_blocked", "guard_rewritten"):
+            _resp_marker = "\n## Response\n\n"
+            if _resp_marker in output:
+                _head, _sep, _ = output.partition(_resp_marker)
+                output = _head + _sep + final_response + "\n"
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
