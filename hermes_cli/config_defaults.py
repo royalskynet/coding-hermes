@@ -1789,6 +1789,11 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Existing skill roots that Hermes may discover/view but never mutate.
+        # Example: ["~/.claude/skills"]. Empty preserves external-dir writes.
+        "readonly_paths": [],
+        # Maximum staged skill writes. Invalid/non-positive values use 50.
+        "pending_limit": 50,
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

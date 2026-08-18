@@ -496,6 +496,83 @@ class TestExternalSkillMutations:
         # No duplicate in local
         assert not (local / "ext-skill").exists()
 
+    def test_missing_target_fails_before_approval_gate(self, tmp_path):
+        from tools import write_approval as wa
+
+        local = tmp_path / "local"
+        local.mkdir()
+        with _two_roots(local, tmp_path / "unused"), \
+             patch.object(wa, "write_approval_enabled", return_value=True):
+            before = wa.pending_count(wa.SKILLS)
+            result = json.loads(skill_manage(
+                action="patch", name="does-not-exist",
+                old_string="old", new_string="new",
+            ))
+
+        assert result["success"] is False
+        assert "Nothing was staged" in result["error"]
+        assert wa.pending_count(wa.SKILLS) == before
+
+    def test_readonly_path_fails_but_other_external_still_writes(self, tmp_path, monkeypatch):
+        local = tmp_path / "local"
+        external = tmp_path / "vault"
+        local.mkdir(); external.mkdir()
+        readonly_skill = _write_external_skill(external, "readonly-skill")
+        monkeypatch.setattr(
+            "agent.skill_utils.get_readonly_skills_dirs", lambda: [external],
+            raising=False,
+        )
+
+        with _two_roots(local, external):
+            result = json.loads(skill_manage(
+                action="patch", name="readonly-skill",
+                old_string="OLD_MARKER", new_string="NEW_MARKER",
+            ))
+
+        assert result["success"] is False
+        assert "read-only" in result["error"].lower()
+        assert "OLD_MARKER" in (readonly_skill / "SKILL.md").read_text()
+
+    def test_qualified_and_symlinked_skill_lookup(self, tmp_path):
+        from tools.skill_manager_tool import _find_skill
+        local = tmp_path / "local"
+        source = tmp_path / "source"
+        local.mkdir(); source.mkdir()
+        qualified = source / "software-development" / "plan-execution-loop"
+        qualified.mkdir(parents=True)
+        (qualified / "SKILL.md").write_text("# qualified")
+        (local / "linked").symlink_to(source, target_is_directory=True)
+        with _two_roots(local, local):
+            assert _find_skill("linked/software-development/plan-execution-loop")["path"].resolve() == qualified
+            assert _find_skill("../escape") is None
+            assert _find_skill(str(qualified)) is None
+
+    def test_skill_lookup_only_sees_active_org_mirror(self, tmp_path):
+        from tools.skill_manager_tool import _find_skill
+        local = tmp_path / "local"
+        for org, skill in (("active", "visible-skill"), ("inactive", "hidden-skill")):
+            path = local / "_org" / org / skill
+            path.mkdir(parents=True)
+            (path / "SKILL.md").write_text(f"# {skill}")
+        (local / "_org" / ".active_org").write_text("active")
+        with _two_roots(local, local):
+            assert _find_skill("visible-skill") is not None
+            assert _find_skill("hidden-skill") is None
+
+    def test_approved_replay_still_respects_readonly(self, tmp_path, monkeypatch):
+        from tools.skill_manager_tool import apply_skill_pending
+        local = tmp_path / "local"; external = tmp_path / "vault"
+        local.mkdir(); external.mkdir()
+        skill_dir = _write_external_skill(external, "readonly-replay")
+        monkeypatch.setattr("agent.skill_utils.get_readonly_skills_dirs", lambda: [external])
+        with _two_roots(local, external):
+            result = json.loads(apply_skill_pending({
+                "action": "patch", "name": "readonly-replay",
+                "old_string": "OLD_MARKER", "new_string": "NEW_MARKER",
+            }))
+        assert result["success"] is False
+        assert "OLD_MARKER" in (skill_dir / "SKILL.md").read_text()
+
 
     def test_background_review_refuses_to_patch_pinned_skill(self, tmp_path):
         """#25839: the autonomous review fork respects pin like the curator

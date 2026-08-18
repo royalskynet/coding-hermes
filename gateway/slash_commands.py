@@ -3513,7 +3513,7 @@ class GatewaySlashCommandsMixin:
             wa.SKILLS, args, set_mode_fn=_set_approval,
         )
         if out is None:
-            return ("Unknown /skills subcommand on this platform. Use: pending, "
+            return ("Unknown /skills subcommand on this platform. Use: pending, triage, "
                     "approve <id>, reject <id>, diff <id>, approval <on|off>. "
                     "(Search/install are CLI-only.)")
 

@@ -958,6 +958,8 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
+    if not record.get("staged", True):
+        return tool_error(record.get("error", "Memory write was not staged."), success=False)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},
@@ -1005,6 +1007,8 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
+    if not record.get("staged", True):
+        return tool_error(record.get("error", "Memory write was not staged."), success=False)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},
@@ -1234,7 +1238,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

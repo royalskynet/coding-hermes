@@ -11,6 +11,9 @@ import json
 import os
 import tempfile
 import shutil
+import threading
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -192,6 +195,104 @@ def test_handle_approval_off(hermes_home):
     )
     assert captured["enabled"] is False
     assert "off" in out
+
+
+def test_missing_skill_diff_is_not_fake_full_addition(hermes_home):
+    from tools import write_approval as wa
+
+    rec = {
+        "id": "deadbeef",
+        "action": "patch",
+        "payload": {"action": "patch", "name": "missing-skill",
+                    "old_string": "old", "new_string": "new"},
+    }
+    with patch("tools.skill_manager_tool._find_skill", return_value=None):
+        out = wa.skill_pending_diff(rec)
+    assert "does not exist on disk" in out
+    assert "/skills reject deadbeef" in out
+    assert "--- a/SKILL.md" not in out
+
+
+def test_readonly_skill_diff_has_banner(hermes_home, tmp_path, monkeypatch):
+    from tools import write_approval as wa
+    skill = tmp_path / "vault" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("old")
+    monkeypatch.setattr("agent.skill_utils.get_readonly_skills_dirs", lambda: [tmp_path / "vault"])
+    rec = {"id": "abc", "action": "patch", "payload": {
+        "action": "patch", "name": "demo", "old_string": "old", "new_string": "new"}}
+    with patch("tools.skill_manager_tool._find_skill", return_value={"path": skill}):
+        out = wa.skill_pending_diff(rec)
+    assert out.startswith("[READONLY]")
+    assert "+new" in out
+
+
+def test_skill_pending_limit_refuses_without_ghost_id(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"skills": {"pending_limit": 1}},
+    )
+    first = wa.stage_write(wa.SKILLS, {"action": "create", "name": "one"},
+                           summary="one", origin="foreground")
+    second = wa.stage_write(wa.SKILLS, {"action": "create", "name": "two"},
+                            summary="two", origin="foreground")
+    assert first["staged"] is True
+    assert second["staged"] is False
+    assert "id" not in second
+    assert wa.pending_count(wa.SKILLS) == 1
+
+
+@pytest.mark.parametrize("raw", [None, "bad", 0, -3, True])
+def test_invalid_skill_pending_limit_falls_back_to_50(hermes_home, monkeypatch, raw):
+    from tools import write_approval as wa
+    monkeypatch.setattr("hermes_cli.config.load_config",
+                        lambda: {"skills": {"pending_limit": raw}})
+    assert wa._skill_pending_limit() == 50
+
+
+def test_concurrent_skill_staging_does_not_exceed_limit(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+    monkeypatch.setattr("hermes_cli.config.load_config",
+                        lambda: {"skills": {"pending_limit": 1}})
+    results = []
+    barrier = threading.Barrier(2)
+    def stage(name):
+        barrier.wait()
+        results.append(wa.stage_write(wa.SKILLS, {"action": "create", "name": name},
+                                      summary=name, origin="foreground"))
+    threads = [threading.Thread(target=stage, args=(name,)) for name in ("a", "b")]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert sum(bool(r["staged"]) for r in results) == 1
+    assert wa.pending_count(wa.SKILLS) == 1
+
+
+def test_stage_disk_error_returns_refused_without_id(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+    monkeypatch.setattr(Path, "write_text", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    result = wa.stage_write(wa.MEMORY, {"action": "add"}, summary="x", origin="foreground")
+    assert result["staged"] is False
+    assert "id" not in result
+    assert "disk full" in result["error"]
+
+
+def test_skills_triage_is_read_only_and_tolerates_malformed(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    wa.stage_write(wa.SKILLS, {"action": "patch", "name": "",
+                               "old_string": "x"},
+                   summary="malformed", origin="background_review")
+    pending = Path(hermes_home) / "pending" / "skills"
+    before = {p.name: p.read_bytes() for p in pending.glob("*.json")}
+    with patch("tools.skill_manager_tool._find_skill", return_value=None):
+        out = handle_pending_subcommand(wa.SKILLS, ["triage"])
+    after = {p.name: p.read_bytes() for p in pending.glob("*.json")}
+    assert "Triage skills writes (1)" in out
+    assert "[NOT FOUND]" in out
+    assert before == after
 
 
 # ---------------------------------------------------------------------------

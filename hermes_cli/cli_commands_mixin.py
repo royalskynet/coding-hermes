@@ -1764,7 +1764,7 @@ class CLICommandsMixin:
         # reject/diff/mode); everything else goes to the skills hub.
         parts = cmd.strip().split()
         args = parts[1:] if len(parts) > 1 else []
-        if args and args[0].lower() in {"pending", "approve", "apply", "reject",
+        if args and args[0].lower() in {"pending", "triage", "approve", "apply", "reject",
                                         "deny", "drop", "diff", "approval", "mode"}:
             from hermes_cli.write_approval_commands import handle_pending_subcommand
             from tools import write_approval as wa

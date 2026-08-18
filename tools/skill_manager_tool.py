@@ -650,11 +650,21 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    from agent.skill_utils import (
+        get_all_skills_dirs, is_excluded_skill_path, iter_skill_index_files,
+    )
+    identifier = Path(name)
+    if identifier.is_absolute() or ".." in identifier.parts:
+        return None
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
+        if len(identifier.parts) > 1:
+            direct = skills_dir.joinpath(*identifier.parts) / "SKILL.md"
+            if direct.is_file() and not is_excluded_skill_path(direct):
+                return {"path": direct.parent}
+            continue
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
             if is_excluded_skill_path(skill_md):
                 continue
             if skill_md.parent.name == name:
@@ -749,7 +759,7 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
     matches: List[Tuple[str, Path]] = []
     try:
         from hermes_constants import get_default_hermes_root
-        from agent.skill_utils import is_excluded_skill_path
+        from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
     except Exception:
         return matches
 
@@ -793,7 +803,7 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
         if not skills_dir.is_dir():
             continue
         try:
-            for skill_md in skills_dir.rglob("SKILL.md"):
+            for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
                 if is_excluded_skill_path(skill_md):
                     continue
                 if skill_md.parent.name == name:
@@ -1431,6 +1441,8 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         new_string=payload_kwargs.get("new_string") or "",
     )
     record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    if not record.get("staged", True):
+        return tool_error(record.get("error", "Skill write was not staged."), success=False)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},
@@ -1530,6 +1542,23 @@ def skill_manage(
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
+
+    if action in {"edit", "patch", "delete", "write_file", "remove_file"}:
+        found = _find_skill(name)
+        if found is None:
+            return tool_error(
+                _skill_not_found_error(name, " Nothing was staged."),
+                success=False,
+            )
+        from agent.skill_utils import readonly_skill_root
+        readonly_root = readonly_skill_root(found["path"])
+        if readonly_root is not None:
+            return tool_error(
+                f"Skill '{name}' resolves to {found['path']}, which is under "
+                f"read-only skill root {readonly_root}. Modify it at its source. "
+                "Nothing was staged.",
+                success=False,
+            )
 
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off

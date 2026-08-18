@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -65,6 +66,22 @@ _SUBSYSTEMS = (MEMORY, SKILLS)
 # "block all writes" state — to disable a subsystem entirely use its own
 # enable flag (e.g. ``memory.memory_enabled: false``).
 CONFIG_KEY = "write_approval"
+PENDING_LIMIT_KEY = "pending_limit"
+DEFAULT_SKILL_PENDING_LIMIT = 50
+_STAGE_LOCK = threading.Lock()
+
+
+def _skill_pending_limit() -> int:
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        raw = cfg_get(load_config(), SKILLS, PENDING_LIMIT_KEY,
+                      default=DEFAULT_SKILL_PENDING_LIMIT)
+        if isinstance(raw, bool):
+            raise ValueError
+        value = int(raw)
+        return value if value > 0 else DEFAULT_SKILL_PENDING_LIMIT
+    except Exception:
+        return DEFAULT_SKILL_PENDING_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +142,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
             entry text itself.
         origin: ``foreground`` or ``background_review`` — recorded for audit.
 
-    Returns a dict with ``id`` and metadata. Best-effort: on disk failure it
-    logs and still returns a record (the write is simply lost, which is the
-    safe failure for an approval gate — nothing is silently committed).
+    Returns ``staged=True`` plus the record on success. Limit or disk failures
+    return ``staged=False`` with an error and never expose a ghost record id.
     """
     pid = uuid.uuid4().hex[:8]
     record = {
@@ -139,16 +155,31 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         "created_at": time.time(),
         "payload": payload,
     }
+    tmp = None
     try:
-        d = _pending_dir(subsystem)
-        d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{pid}.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        with _STAGE_LOCK:
+            if subsystem == SKILLS:
+                limit = _skill_pending_limit()
+                if pending_count(subsystem) >= limit:
+                    return {"staged": False, "error": (
+                        f"Pending skills limit ({limit}) reached. Nothing was staged; "
+                        "review with /skills triage."
+                    )}
+            d = _pending_dir(subsystem)
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{pid}.json"
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        return {"staged": True, **record}
     except Exception as e:  # pragma: no cover - disk failure path
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
-    return record
+        return {"staged": False, "error": f"Failed to stage pending {subsystem} write: {e}"}
 
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
@@ -449,6 +480,8 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
         _find_skill = None  # type: ignore
 
     current = ""
+    found = None
+    p = None
     target_label = "SKILL.md"
     if _find_skill is not None:
         found = _find_skill(name)
@@ -467,6 +500,26 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
                     current = p.read_text(encoding="utf-8")
             except Exception:
                 current = ""
+        else:
+            return (
+                f"Skill '{name}' does not exist on disk; this staged record "
+                f"cannot be applied. Reject it with /skills reject {record.get('id', '<id>')}."
+            )
+    if found and p is not None and not p.exists():
+        return (
+            f"Target '{target_label}' for skill '{name}' does not exist on disk; "
+            f"reject with /skills reject {record.get('id', '<id>')}."
+        )
+
+    banner = ""
+    if found:
+        try:
+            from agent.skill_utils import readonly_skill_root
+            root = readonly_skill_root(found["path"])
+            if root is not None:
+                banner = f"[READONLY] {found['path']} is under {root}.\n\n"
+        except Exception:
+            pass
 
     if action == "edit":
         new = payload.get("content") or ""
@@ -490,4 +543,4 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
         tofile=f"b/{target_label}",
     )
     text = "".join(diff)
-    return text or "(no textual change)"
+    return banner + (text or "(no textual change)")

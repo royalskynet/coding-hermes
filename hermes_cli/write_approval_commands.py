@@ -16,6 +16,8 @@ platform the gateway truncates it and points the user at the dashboard / file.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from datetime import datetime
 from typing import List, Optional
 
 from tools import write_approval as wa
@@ -44,6 +46,45 @@ def _fmt_pending_list(subsystem: str) -> str:
     lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
         lines.append("Review full diff: /skills diff <id>")
+    return "\n".join(lines)
+
+
+def _fmt_triage(subsystem: str) -> str:
+    """Summarize pending skill writes without mutating the pending store."""
+    records = wa.list_pending(subsystem)
+    lines = [f"Triage {subsystem} writes ({len(records)}):"]
+    lines.append(f"Origins: {dict(Counter(r.get('origin', '') for r in records))}")
+    lines.append(f"Actions: {dict(Counter(r.get('action', '') for r in records))}")
+    lines.append(f"Days: {dict(Counter(datetime.fromtimestamp(r.get('created_at', 0)).strftime('%Y-%m-%d') for r in records))}")
+    try:
+        from tools.skill_manager_tool import _find_skill
+        from agent.skill_utils import readonly_skill_root
+    except Exception:
+        _find_skill = None
+        readonly_skill_root = lambda _path: None
+    names = Counter((r.get("payload") or {}).get("name") or "<empty>" for r in records)
+    lines.append("Skills:")
+    for name, count in names.most_common():
+        found = _find_skill(name) if _find_skill and name != "<empty>" else None
+        if found is None:
+            status = "[NOT FOUND]"
+        else:
+            root = readonly_skill_root(found["path"])
+            status = "[READONLY]" if root else f"[resolves → {found['path']}]"
+        lines.append(f"  {name}: {count} {status}")
+
+    groups = Counter()
+    latest = {}
+    for record in records:
+        payload = record.get("payload") or {}
+        key = (record.get("action", ""), payload.get("name") or "<empty>",
+               payload.get("file_path", ""), payload.get("old_string", ""))
+        groups[key] += 1
+        latest[key] = record.get("id", "")
+    lines.append("Suggested manual rejects for duplicate groups (latest id):")
+    for key, count in groups.items():
+        if count > 1:
+            lines.append(f"  /{subsystem} reject {latest[key]}  # {key[1]} ({count})")
     return "\n".join(lines)
 
 
@@ -83,6 +124,9 @@ def handle_pending_subcommand(
 
     if sub == "pending":
         return _fmt_pending_list(subsystem)
+
+    if sub == "triage" and subsystem == wa.SKILLS:
+        return _fmt_triage(subsystem)
 
     if sub in {"approve", "apply"}:
         return _approve(subsystem, rest, memory_store)
