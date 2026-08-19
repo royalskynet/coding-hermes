@@ -70,6 +70,10 @@ def _hermes_home(args) -> Path:
 
 
 def run_backlog(args) -> int:
+    if not getattr(args, "dry_run", True):
+        # backlog execution shares auto's semantics: manual -> leave,
+        # llm keep -> judge -> apply/archive, superseded -> archive
+        return run_auto(args)
     hh = _hermes_home(args)
     recs = core.load_pending(hh, limit=args.limit)
     groups = core.group_by_skill(recs)

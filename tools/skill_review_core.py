@@ -245,12 +245,13 @@ def openrouter_key(hermes_home: Path) -> str:
 
 
 def llm_judge(skill_name: str, payload: dict, api_key: str,
-              model: str = "openrouter/free", timeout: int = 60,
+              model: str = None, timeout: int = 60,
               _now=None) -> dict:
     """Verdict for one low-risk patch. Returns
     {'decision': 'approve'|'reject'|'error', 'reason': str}.
     Never raises; transport/parse failures -> error (caller keeps pending)."""
     import urllib.request
+    model = model or os.environ.get("HERMES_SKILL_REVIEW_MODEL", "openrouter/free")
     old = payload.get("old_string") or ""
     new = payload.get("new_string") or ""
     action = payload.get("action")
@@ -270,7 +271,8 @@ def llm_judge(skill_name: str, payload: dict, api_key: str,
     body = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 200,
+        # reasoning models burn budget thinking before the JSON; 200 truncated them
+        "max_tokens": 800,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": sys_prompt},
@@ -285,9 +287,22 @@ def llm_judge(skill_name: str, payload: dict, api_key: str,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        text = data["choices"][0]["message"]["content"]
-        parsed = json.loads(text) if text.strip().startswith("{") else json.loads(
-            re.search(r"\{.*\}", text, re.S).group(0))
+        msg = data["choices"][0]["message"]
+        # reasoning models may leave content null and put the text in 'reasoning'
+        text = (msg.get("content") or msg.get("reasoning") or "").strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+        m = (re.search(r"\{[^{}]*\"decision\"[^{}]*\}", text, re.S)
+             or re.search(r"\{.*\}", text, re.S))
+        if not m:
+            return {"decision": "error", "reason": f"no JSON in reply: {text[:120]!r}"}
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception:
+            # malformed JSON (e.g. unescaped quotes in reason): salvage the verdict
+            dm = re.search(r"\"decision\"\s*:\s*\"(approve|reject)\"", m.group(0))
+            if not dm:
+                raise
+            parsed = {"decision": dm.group(1), "reason": "salvaged from malformed JSON"}
         decision = (parsed.get("decision") or "").strip().lower()
         reason = str(parsed.get("reason") or "")
         if decision in ("approve", "reject"):
