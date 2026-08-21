@@ -9,7 +9,7 @@ An opinionated fork of [NousResearch/hermes-agent](https://github.com/NousResear
 - **Iteration Checkpoint** — JSON checkpoint at every iteration boundary, so turn‑budget exhaustion does not lose progress
 - **SIGTERM Resilience** — loop‑entry checkpoint dumps before each continuation turn survive runtime‑limit kills
 - **Resume Context** — `build_worker_context()` injects a human‑readable resume block into the task context
-- **Behavior Guards** — task‑level discipline rules (pre‑task fixindex lookup, doc research after first failure, three‑strike block)
+- **Behavior Guards** — task‑level discipline shipped as an installable skill + a SOUL CORE snippet (`docs/soul/coding-discipline.md`): three‑layer verification, two stop‑loss axes, fixindex write verification, acceptance discipline
 
 Built on upstream `NousResearch/hermes-agent` with 4 local commits (~100 lines of code changed).
 
@@ -28,7 +28,7 @@ Built on upstream `NousResearch/hermes-agent` with 4 local commits (~100 lines o
 | **Iteration Checkpoint** | 每次 iteration 邊界寫入 JSON checkpoint（`~/.hermes/kanban-checkpoints/`），記錄 iteration 數、judge verdict、response snippet |
 | **Loop-Entry Checkpoint** | 在每次 continuation turn 前也寫入 checkpoint，避免 runtime timeout 導致進度遺失 |
 | **Resume Context Injection** | `build_worker_context()` 自動偵測 checkpoint 存在，在 task context 中注入 resume block |
-| **Task-Level Behavior Rules** | 透過 SOUL.md 設定三層行為紀律：啟動前查 fixindex、首輪失敗後查 docs/GitHub、三路線失敗後記錄並阻斷 |
+| **Task-Level Behavior Rules** | 行為紀律由 [coding-hermes-skill](https://github.com/royalskynet/coding-hermes-skill) 提供（三層查證、停損兩軸、fixindex 查寫驗證、驗收紀律、膠水思維、架構原則）。本 repo 附 SOUL CORE 片段 [`docs/soul/coding-discipline.md`](docs/soul/coding-discipline.md)，貼進 profile 的 SOUL.md 即生效 |
 
 ### Dev Log
 
@@ -51,7 +51,7 @@ Built on upstream `NousResearch/hermes-agent` with 4 local commits (~100 lines o
 | **Iteration Checkpoint** | JSON checkpoint written at every iteration boundary (`~/.hermes/kanban-checkpoints/`), recording iteration count, judge verdict, and response snippet |
 | **Loop-Entry Checkpoint** | Checkpoint also written before each continuation turn, so SIGTERM from runtime limits does not lose progress |
 | **Resume Context Injection** | `build_worker_context()` automatically detects existing checkpoints and injects a resume block into the task context |
-| **Task-Level Behavior Rules** | Three‑layer discipline baked into the agent's SOUL.md: pre‑task fixindex lookup, doc/GitHub research after first failure, and fixindex recording + block after three distinct approaches fail |
+| **Task-Level Behavior Rules** | Discipline ships as [coding-hermes-skill](https://github.com/royalskynet/coding-hermes-skill) (three-layer verification, two stop-loss axes, fixindex read/write verification, acceptance discipline, glue coding, architecture principles). This repo ships the SOUL CORE snippet [`docs/soul/coding-discipline.md`](docs/soul/coding-discipline.md) — paste it into your profile's SOUL.md to activate |
 
 ### Dev Log
 
@@ -96,4 +96,5 @@ npx skills add https://github.com/royalskynet/coding-hermes-skill --skill coding
 # Verify
 fixindex help
 ls ~/.hermes/skills/coding-hermes/SKILL.md
+cat docs/soul/coding-discipline.md   # paste the CORE block into your profile SOUL.md
 ```
