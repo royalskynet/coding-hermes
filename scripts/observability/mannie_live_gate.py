@@ -304,7 +304,7 @@ def main():
     }
 
     report_path = output_dir / f"mannie-live-gate-report-{timestamp}.json"
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     print(f"\nReport: {report_path}")
 
@@ -333,7 +333,7 @@ def main():
     )
 
     checklist_path = output_dir / f"mannie-live-gate-checklist-{timestamp}.md"
-    with open(checklist_path, "w") as f:
+    with open(checklist_path, "w", encoding="utf-8") as f:
         f.write(checklist)
     print(f"Checklist: {checklist_path}")
 

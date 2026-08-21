@@ -33,7 +33,7 @@ class _Lock:
 
     def try_acquire(self) -> bool:
         import fcntl
-        self.fd = open(self.lock_path, "w")
+        self.fd = open(self.lock_path, "w", encoding="utf-8")
         try:
             fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.fd.write(f"pid={os.getpid()} ts={time.time()}\n")
