@@ -80,7 +80,7 @@ b7e3c8bf  kanban: inject resume checkpoint context in build_worker_context
 ## Dependencies
 
 - [fixindex](https://github.com/royalskynet/fixindex) — bug runbook CLI for symptom→fix lookup; used in pre-task context lookup
-- [mdispatch](https://github.com/royalskynet/mdispatch) — plan.md dispatch tool for kanban task creation with falsifiability lint
+- [coding-hermes-skill](https://github.com/royalskynet/coding-hermes-skill) — the coding-agent behavior doctrine of this fork, packaged as an installable skill
 - [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) — upstream source
 
 ### Quick install
@@ -90,11 +90,10 @@ b7e3c8bf  kanban: inject resume checkpoint context in build_worker_context
 curl -sSL https://raw.githubusercontent.com/royalskynet/fixindex/main/fixindex \
   | sudo tee /usr/local/bin/fixindex > /dev/null && sudo chmod +x /usr/local/bin/fixindex
 
-# mdispatch (separate repo)
-curl -sSL https://raw.githubusercontent.com/royalskynet/mdispatch/main/mdispatch \
-  | sudo tee /usr/local/bin/mdispatch > /dev/null && sudo chmod +x /usr/local/bin/mdispatch
+# coding-hermes skill (no sudo, no PATH changes)
+npx skills add https://github.com/royalskynet/coding-hermes-skill --skill coding-hermes
 
 # Verify
 fixindex help
-mdispatch --help
+ls ~/.hermes/skills/coding-hermes/SKILL.md
 ```
