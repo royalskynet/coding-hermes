@@ -13,6 +13,20 @@ An opinionated fork of [NousResearch/hermes-agent](https://github.com/NousResear
 
 Built on upstream `NousResearch/hermes-agent` with 4 local commits (~100 lines of code changed).
 
+## Installing the agent itself
+
+This fork carries upstream's installers unchanged — use them to install Hermes, then apply this fork on top.
+
+**Windows** (PowerShell) — run upstream's bundled installer, `scripts/install.ps1`:
+
+```powershell
+iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+```
+
+It provisions uv, Python 3.11, Node.js, ripgrep, ffmpeg and a portable MinGit under `%LOCALAPPDATA%\hermes` — no admin rights, isolated from any system Git. If you prefer WSL2, the Linux path below works there too.
+
+**Linux / macOS** — see [upstream's README](https://github.com/NousResearch/hermes-agent#installation).
+
 ---
 
 ## 繁體中文

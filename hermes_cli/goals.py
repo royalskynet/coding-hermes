@@ -1987,7 +1987,7 @@ def _checkpoint_dump(task_id: str, state: dict) -> None:
     path = os.path.join(d, f"{task_id}.json")
     state["recorded_at"] = time.time()
     try:
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, sort_keys=True)
     except Exception:
         pass  # non-fatal — the loop should not fail because of checkpoint
@@ -2000,7 +2000,7 @@ def _checkpoint_load(task_id: str) -> Optional[dict]:
     """
     path = os.path.join(_checkpoint_dir(), f"{task_id}.json")
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
             return data if isinstance(data, dict) else None
     except (FileNotFoundError, json.JSONDecodeError):
