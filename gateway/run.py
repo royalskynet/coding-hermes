@@ -11218,7 +11218,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._update_runtime_status("running")
 
         try:
-            from gateway.health_gate import HealthGate, HealthSample, sample_process
+            from gateway.health_gate import (
+                HealthGate,
+                HealthSample,
+                collect_telegram_health,
+                sample_process,
+                schedule_graceful_restart,
+            )
             from hermes_cli.config import load_config as _load_health_config
 
             _raw = _load_health_config()
@@ -11229,20 +11235,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 base = sample_process()
                 telegram = next((a for p, a in self.adapters.items()
                     if getattr(p, "value", str(p)) == "telegram"), None)
-                tg_state = "connected" if telegram is not None and telegram.is_connected() else "disconnected"
-                failures, backoff = 0, None
-                for transport in getattr(telegram, "_health_fallback_transports", ()):
-                    failures = max(failures, int(getattr(
-                        transport, "consecutive_fallback_failures", 0) or 0))
-                for platform, info in self._failed_platforms.items():
-                    if getattr(platform, "value", str(platform)) == "telegram":
-                        failures = max(failures, int(info.get("attempts", 0) or 0))
-                        retry_at = info.get("next_retry")
-                        if retry_at is not None:
-                            backoff = max(0.0, float(retry_at) - time.monotonic())
+                tg_state, failures, breaker, backoff = collect_telegram_health(
+                    telegram, self._failed_platforms
+                )
                 return HealthSample(base.fd_total, base.close_wait, base.cpu_percent,
-                    tg_state, failures,
-                    "tripped" if self._restart_task_started else "closed", backoff)
+                    tg_state, failures, breaker, backoff)
 
             def _notice(message: str) -> None:
                 loop = self._gateway_loop
@@ -11251,9 +11248,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._send_health_degraded_notice(message)))
 
             def _restart() -> None:
-                loop = self._gateway_loop
-                if loop is not None and not loop.is_closed():
-                    loop.call_soon_threadsafe(self.request_restart)
+                schedule_graceful_restart(self._gateway_loop, self.request_restart)
 
             self._health_gate = HealthGate(_health_cfg, sampler=_runtime_health_sample,
                 notice_callback=_notice, restart_callback=_restart)

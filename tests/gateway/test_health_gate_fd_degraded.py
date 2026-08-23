@@ -1,4 +1,12 @@
-from gateway.health_gate import HealthGate, HealthSample, health_gate_allows_long_work
+import logging
+
+from gateway.health_gate import (
+    HealthGate,
+    HealthSample,
+    collect_telegram_health,
+    health_gate_allows_long_work,
+    schedule_graceful_restart,
+)
 
 
 def _sample(fd=20, close_wait=0, failures=0):
@@ -72,3 +80,48 @@ def test_clearly_unhealthy_sample_is_never_ok(tmp_path):
     gate = HealthGate(state_path=tmp_path / "health_gate.json")
 
     assert gate.evaluate(_sample(fd=999, close_wait=999, failures=99)).state != "ok"
+
+
+def test_invalid_intervals_fall_back_to_safe_default(tmp_path):
+    for value in (0, -1, float("inf"), float("nan"), "invalid"):
+        gate = HealthGate(
+            config={"sample_interval_seconds": value},
+            state_path=tmp_path / f"state-{str(value)}.json",
+        )
+        assert gate.sample_interval == 60
+
+
+def test_telegram_pause_is_open_but_gateway_restart_latch_is_irrelevant(caplog, tmp_path):
+    class Adapter:
+        def is_connected(self):
+            return False
+
+    sample = collect_telegram_health(
+        Adapter(),
+        {"telegram": {"attempts": 7, "paused": True, "next_retry": float("inf")}},
+        now=100.0,
+    )
+    assert sample == ("disconnected", 7, "open", None)
+
+    gate = HealthGate(state_path=tmp_path / "health.json")
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        gate._log(_sample().__class__(20, 0, 1.0, sample[0], sample[1], sample[2], sample[3]))
+    assert "breaker=open" in caplog.text
+    # No restart-latch parameter exists: whole-gateway restart cannot be
+    # mislabeled as the Telegram breaker.
+
+
+def test_production_restart_scheduler_calls_injected_request_restart():
+    scheduled = []
+
+    class Loop:
+        def is_closed(self):
+            return False
+
+        def call_soon_threadsafe(self, callback):
+            scheduled.append(callback)
+
+    calls = []
+    schedule_graceful_restart(Loop(), lambda: calls.append("request_restart"))
+    scheduled[0]()
+    assert calls == ["request_restart"]

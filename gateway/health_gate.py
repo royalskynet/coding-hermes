@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import threading
@@ -88,7 +89,9 @@ class HealthGate:
         clock: Callable[[], float] = time.time,
     ) -> None:
         cfg = config or {}
-        self.sample_interval = self._number(cfg, "sample_interval_seconds", DEFAULT_SAMPLE_INTERVAL_SECONDS)
+        self.sample_interval = self._interval(cfg.get(
+            "sample_interval_seconds", DEFAULT_SAMPLE_INTERVAL_SECONDS
+        ))
         self.degraded_fd = self._number(cfg, "degraded_fd", DEFAULT_DEGRADED_FD)
         self.degraded_close_wait = self._number(cfg, "degraded_close_wait", DEFAULT_DEGRADED_CLOSE_WAIT)
         self.fallback_failures = self._number(cfg, "consecutive_fallback_failures", DEFAULT_FALLBACK_FAILURES)
@@ -116,9 +119,20 @@ class HealthGate:
     def _number(cfg: Mapping[str, object], key: str, default: int) -> Optional[float]:
         try:
             value = float(cfg.get(key, default))
-            return value if value >= 0 else None
+            return value if math.isfinite(value) and value >= 0 else None
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _interval(value: object) -> float:
+        """Return a finite positive interval; unsafe values use 60 seconds."""
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(DEFAULT_SAMPLE_INTERVAL_SECONDS)
+        if not math.isfinite(parsed) or parsed <= 0:
+            return float(DEFAULT_SAMPLE_INTERVAL_SECONDS)
+        return parsed
 
     def _load_state(self) -> None:
         try:
@@ -244,3 +258,64 @@ def health_gate_allows_long_work(gate: Optional[HealthGate]) -> bool:
         return gate is None or gate.state == "ok"
     except Exception:
         return True
+
+
+def collect_telegram_health(adapter, failed_platforms, *, now: Optional[float] = None):
+    """Return Telegram state/failures/breaker/backoff from live transport state.
+
+    Transports may expose ``health_breaker_state`` and
+    ``health_backoff_seconds``. This small interface is intentionally ready
+    for the transport-level breaker added by the next hardening task.
+    """
+    connected = False
+    try:
+        connected = adapter is not None and bool(adapter.is_connected())
+    except Exception:
+        pass
+    connection_state = "connected" if connected else "disconnected"
+    failures = 0
+    breaker_state = "closed"
+    backoff = None
+    for transport in getattr(adapter, "_health_fallback_transports", ()):
+        try:
+            failures = max(failures, int(getattr(
+                transport, "consecutive_fallback_failures", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        state = str(getattr(transport, "health_breaker_state", "closed") or "closed")
+        if state != "closed":
+            breaker_state = state
+        transport_backoff = getattr(transport, "health_backoff_seconds", None)
+        if transport_backoff is not None:
+            try:
+                candidate = float(transport_backoff)
+                if math.isfinite(candidate) and candidate >= 0:
+                    backoff = candidate
+            except (TypeError, ValueError):
+                pass
+
+    monotonic_now = time.monotonic() if now is None else now
+    for platform, info in (failed_platforms or {}).items():
+        if getattr(platform, "value", str(platform)) != "telegram":
+            continue
+        try:
+            failures = max(failures, int(info.get("attempts", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        if info.get("paused"):
+            breaker_state = "open"
+        retry_at = info.get("next_retry")
+        if retry_at is not None:
+            try:
+                candidate = float(retry_at) - monotonic_now
+                if math.isfinite(candidate):
+                    backoff = max(0.0, candidate)
+            except (TypeError, ValueError):
+                pass
+    return connection_state, failures, breaker_state, backoff
+
+
+def schedule_graceful_restart(loop, request_restart: Callable[[], object]) -> None:
+    """Thread-safe injectable bridge to GatewayRunner.request_restart()."""
+    if loop is not None and not loop.is_closed():
+        loop.call_soon_threadsafe(request_restart)
