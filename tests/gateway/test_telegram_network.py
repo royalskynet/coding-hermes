@@ -279,6 +279,31 @@ class TestFallbackTransportInit:
 
 class TestFallbackTransportClose:
     @pytest.mark.asyncio
+    async def test_non_retryable_fallback_error_discards_its_pool(self, monkeypatch):
+        """A peer-side read failure must not leave a fallback socket pooled.
+
+        A fallback peer can accept TCP and then close during TLS/HTTP, yielding
+        ReadError rather than ConnectError.  Keeping that transport retains
+        CLOSE_WAIT descriptors across later reconnect attempts.
+        """
+        calls = []
+        factory = _fake_transport_factory(
+            calls,
+            {
+                "api.telegram.org": "timeout",
+                "149.154.167.220": httpx.ReadError("peer closed"),
+            },
+        )
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+
+        with pytest.raises(httpx.ReadError):
+            await transport.handle_async_request(_telegram_request())
+
+        assert "149.154.167.220" not in transport._fallbacks
+        assert factory.instances[1].closed is True
+
+    @pytest.mark.asyncio
     async def test_aclose_closes_all_transports(self, monkeypatch):
         factory = _fake_transport_factory([], {})
         monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)

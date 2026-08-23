@@ -131,6 +131,14 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 return response
             except Exception as exc:
                 last_error = exc
+                # A peer can accept TCP and then close during TLS/HTTP.  httpx
+                # surfaces that as ReadError/ProtocolError rather than a
+                # ConnectError, but retaining its fallback pool leaves the
+                # peer-closed socket in CLOSE_WAIT across later reconnects.
+                # Discard any failed fallback pool before deciding whether the
+                # error itself is retryable.
+                if ip is not None:
+                    await self._reset_fallback(ip)
                 if not _is_retryable_connect_error(exc):
                     raise
                 if ip is not None and ip == self._sticky_ip:
@@ -149,7 +157,6 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                     )
                     continue
                 logger.warning("[Telegram] Fallback IP %s failed: %s", ip, exc)
-                await self._reset_fallback(ip)
                 continue
 
         if last_error is None:
