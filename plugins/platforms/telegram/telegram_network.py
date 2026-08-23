@@ -13,13 +13,59 @@ import asyncio
 import ipaddress
 import logging
 import socket
-from typing import Iterable, Optional
+import threading
+import time
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_HOST = "api.telegram.org"
+
+DEFAULT_BACKOFF_INITIAL = 1.0
+DEFAULT_BACKOFF_MULTIPLIER = 2.0
+DEFAULT_BACKOFF_MAXIMUM = 60.0
+DEFAULT_BREAKER_FAILURE_THRESHOLD = 5
+DEFAULT_BREAKER_COOLDOWN = 60.0
+
+
+def telegram_recovery_kwargs(config: Mapping[str, Any] | None) -> dict[str, float | int]:
+    """Translate gateway health config into safe transport constructor args.
+
+    Invalid or unavailable config fails open to built-in defaults so a typo in
+    health telemetry cannot prevent Telegram from connecting.
+    """
+    source = config if isinstance(config, Mapping) else {}
+
+    def _number(key: str, default: float) -> float:
+        try:
+            return float(source.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _integer(key: str, default: int) -> int:
+        try:
+            return int(source.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "backoff_initial": _number(
+            "telegram_backoff_initial_seconds", DEFAULT_BACKOFF_INITIAL),
+        "backoff_multiplier": _number(
+            "telegram_backoff_multiplier", DEFAULT_BACKOFF_MULTIPLIER),
+        "backoff_maximum": _number(
+            "telegram_backoff_maximum_seconds", DEFAULT_BACKOFF_MAXIMUM),
+        "breaker_failure_threshold": _integer(
+            "telegram_breaker_failure_threshold", DEFAULT_BREAKER_FAILURE_THRESHOLD),
+        "breaker_cooldown": _number(
+            "telegram_breaker_cooldown_seconds", DEFAULT_BREAKER_COOLDOWN),
+    }
+
+
+class TelegramCircuitOpenError(httpx.ConnectError):
+    """Raised without network I/O while Telegram's recovery circuit is open."""
 
 # DNS-over-HTTPS providers used to discover Telegram API IPs that may differ
 # from the (potentially unreachable) IP returned by the local system resolver.
@@ -63,7 +109,19 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     # on its own (#63311).
     _POOL_LIMITS = httpx.Limits(max_connections=8, max_keepalive_connections=4)
 
-    def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
+    def __init__(
+        self,
+        fallback_ips: Iterable[str],
+        *,
+        backoff_initial: float = DEFAULT_BACKOFF_INITIAL,
+        backoff_multiplier: float = DEFAULT_BACKOFF_MULTIPLIER,
+        backoff_maximum: float = DEFAULT_BACKOFF_MAXIMUM,
+        breaker_failure_threshold: int = DEFAULT_BREAKER_FAILURE_THRESHOLD,
+        breaker_cooldown: float = DEFAULT_BREAKER_COOLDOWN,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        **transport_kwargs,
+    ):
         self._fallback_ips = list(dict.fromkeys(_normalize_fallback_ips(fallback_ips)))
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
         if proxy_url and "proxy" not in transport_kwargs:
@@ -76,12 +134,82 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         self._fallback_lock = asyncio.Lock()
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
+        self._state_lock = threading.Lock()
+        self._recovery_lock = asyncio.Lock()
         self._consecutive_fallback_failures = 0
+        self._breaker_state = "closed"
+        self._breaker_opened_at: Optional[float] = None
+        self._backoff_seconds = 0.0
+        self._next_attempt_at = 0.0
+        self._backoff_initial = max(0.0, float(backoff_initial))
+        self._backoff_multiplier = max(1.0, float(backoff_multiplier))
+        self._backoff_maximum = max(self._backoff_initial, float(backoff_maximum))
+        self._breaker_failure_threshold = max(1, int(breaker_failure_threshold))
+        self._breaker_cooldown = max(0.0, float(breaker_cooldown))
+        self._clock = clock
+        self._sleep = sleep
 
     @property
     def consecutive_fallback_failures(self) -> int:
-        """Failures since the last successful fallback request (health telemetry)."""
-        return self._consecutive_fallback_failures
+        """Consecutive requests for which primary and every fallback failed."""
+        with self._state_lock:
+            return self._consecutive_fallback_failures
+
+    @property
+    def health_breaker_state(self) -> str:
+        with self._state_lock:
+            return self._breaker_state
+
+    @property
+    def health_backoff_seconds(self) -> float:
+        with self._state_lock:
+            return self._backoff_seconds
+
+    def _admit_request(self) -> float:
+        """Reserve a half-open probe or return remaining closed-state backoff."""
+        now = self._clock()
+        with self._state_lock:
+            if self._breaker_state == "open":
+                opened_at = self._breaker_opened_at
+                if opened_at is None or now - opened_at < self._breaker_cooldown:
+                    raise TelegramCircuitOpenError("Telegram recovery circuit is open")
+                self._breaker_state = "half_open"
+                return 0.0
+            if self._breaker_state == "half_open":
+                raise TelegramCircuitOpenError("Telegram half-open probe already in progress")
+            return max(0.0, self._next_attempt_at - now)
+
+    async def _wait_for_recovery_window(self, delay: float) -> None:
+        if delay <= 0:
+            return
+        async with self._recovery_lock:
+            # Another waiter may have completed recovery while this task queued.
+            remaining = self._admit_request()
+            if remaining > 0:
+                await self._sleep(remaining)
+
+    def _record_success(self) -> None:
+        with self._state_lock:
+            self._consecutive_fallback_failures = 0
+            self._breaker_state = "closed"
+            self._breaker_opened_at = None
+            self._backoff_seconds = 0.0
+            self._next_attempt_at = 0.0
+
+    def _record_all_path_failure(self) -> None:
+        now = self._clock()
+        with self._state_lock:
+            self._consecutive_fallback_failures += 1
+            next_backoff = (
+                self._backoff_initial
+                if self._backoff_seconds <= 0
+                else self._backoff_seconds * self._backoff_multiplier
+            )
+            self._backoff_seconds = min(self._backoff_maximum, next_backoff)
+            self._next_attempt_at = now + self._backoff_seconds
+            if self._consecutive_fallback_failures >= self._breaker_failure_threshold:
+                self._breaker_state = "open"
+                self._breaker_opened_at = now
 
     async def _get_fallback(self, ip: str) -> httpx.AsyncHTTPTransport:
         async with self._fallback_lock:
@@ -112,6 +240,16 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
             return await self._primary.handle_async_request(request)
 
+        # Breaker bookkeeping is advisory: any internal error fails open and
+        # lets the real Telegram request proceed rather than wedging the bot.
+        try:
+            delay = self._admit_request()
+            await self._wait_for_recovery_window(delay)
+        except TelegramCircuitOpenError:
+            raise
+        except Exception as exc:
+            logger.warning("[Telegram] Recovery state unavailable; failing open: %s", exc)
+
         sticky_ip = self._sticky_ip
         attempt_order: list[Optional[str]] = [sticky_ip] if sticky_ip else [None]
         if sticky_ip:
@@ -126,8 +264,10 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
-                if ip is not None:
-                    self._consecutive_fallback_failures = 0
+                try:
+                    self._record_success()
+                except Exception as exc:
+                    logger.warning("[Telegram] Could not reset recovery state: %s", exc)
                 if ip is not None and self._sticky_ip != ip:
                     async with self._sticky_lock:
                         if self._sticky_ip != ip:
@@ -146,7 +286,6 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 # Discard any failed fallback pool before deciding whether the
                 # error itself is retryable.
                 if ip is not None:
-                    self._consecutive_fallback_failures += 1
                     await self._reset_fallback(ip)
                 if not _is_retryable_connect_error(exc):
                     raise
@@ -170,6 +309,10 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
 
         if last_error is None:
             raise RuntimeError("All Telegram fallback IPs exhausted but no error was recorded")
+        try:
+            self._record_all_path_failure()
+        except Exception as exc:
+            logger.warning("[Telegram] Could not record recovery failure; failing open: %s", exc)
         raise last_error
 
     async def aclose(self) -> None:

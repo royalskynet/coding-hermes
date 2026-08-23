@@ -304,6 +304,7 @@ from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
     discover_fallback_ips,
     parse_fallback_ip_env,
+    telegram_recovery_kwargs,
 )
 from utils import atomic_replace, env_float, env_int
 
@@ -3818,6 +3819,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 _transport_kwargs: dict = {}
                 if _pool_limits is not None:
                     _transport_kwargs["limits"] = _pool_limits
+                try:
+                    from hermes_cli.config import load_config_readonly
+
+                    _raw_config = load_config_readonly()
+                    _gateway_config = _raw_config.get("gateway", {})
+                    _health_config = _gateway_config.get("health_gate", {})
+                except Exception:
+                    logger.warning(
+                        "[%s] Telegram recovery config unavailable; using defaults",
+                        self.name,
+                        exc_info=True,
+                    )
+                    _health_config = {}
+                _transport_kwargs.update(telegram_recovery_kwargs(_health_config))
                 request_transport = TelegramFallbackTransport(
                     fallback_ips, **_transport_kwargs
                 )
