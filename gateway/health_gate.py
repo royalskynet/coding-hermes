@@ -269,7 +269,10 @@ def collect_telegram_health(adapter, failed_platforms, *, now: Optional[float] =
     """
     connected = False
     try:
-        connected = adapter is not None and bool(adapter.is_connected())
+        connection_value = getattr(adapter, "is_connected", False)
+        connected = adapter is not None and bool(
+            connection_value() if callable(connection_value) else connection_value
+        )
     except Exception:
         pass
     connection_state = "connected" if connected else "disconnected"

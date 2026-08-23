@@ -111,6 +111,13 @@ def test_telegram_pause_is_open_but_gateway_restart_latch_is_irrelevant(caplog, 
     # mislabeled as the Telegram breaker.
 
 
+def test_telegram_health_reads_base_adapter_property_shape():
+    class Adapter:
+        is_connected = True
+
+    assert collect_telegram_health(Adapter(), {})[0] == "connected"
+
+
 def test_production_restart_scheduler_calls_injected_request_restart():
     scheduled = []
 
