@@ -3818,20 +3818,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 _transport_kwargs: dict = {}
                 if _pool_limits is not None:
                     _transport_kwargs["limits"] = _pool_limits
+                request_transport = TelegramFallbackTransport(
+                    fallback_ips, **_transport_kwargs
+                )
+                updates_transport = TelegramFallbackTransport(
+                    fallback_ips, **_transport_kwargs
+                )
+                self._health_fallback_transports = (request_transport, updates_transport)
                 request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={
-                        "transport": TelegramFallbackTransport(
-                            fallback_ips, **_transport_kwargs
-                        )
+                        "transport": request_transport
                     },
                 )
                 get_updates_request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={
-                        "transport": TelegramFallbackTransport(
-                            fallback_ips, **_transport_kwargs
-                        )
+                        "transport": updates_transport
                     },
                 )
             elif proxy_url:

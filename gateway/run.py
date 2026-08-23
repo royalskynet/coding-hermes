@@ -5800,6 +5800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._health_gate = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
@@ -11216,6 +11217,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._update_runtime_status("running")
 
+        try:
+            from gateway.health_gate import HealthGate, HealthSample, sample_process
+            from hermes_cli.config import load_config as _load_health_config
+
+            _raw = _load_health_config()
+            _gw = _raw.get("gateway", {}) if isinstance(_raw, dict) else {}
+            _health_cfg = _gw.get("health_gate", {}) if isinstance(_gw, dict) else {}
+
+            def _runtime_health_sample() -> HealthSample:
+                base = sample_process()
+                telegram = next((a for p, a in self.adapters.items()
+                    if getattr(p, "value", str(p)) == "telegram"), None)
+                tg_state = "connected" if telegram is not None and telegram.is_connected() else "disconnected"
+                failures, backoff = 0, None
+                for transport in getattr(telegram, "_health_fallback_transports", ()):
+                    failures = max(failures, int(getattr(
+                        transport, "consecutive_fallback_failures", 0) or 0))
+                for platform, info in self._failed_platforms.items():
+                    if getattr(platform, "value", str(platform)) == "telegram":
+                        failures = max(failures, int(info.get("attempts", 0) or 0))
+                        retry_at = info.get("next_retry")
+                        if retry_at is not None:
+                            backoff = max(0.0, float(retry_at) - time.monotonic())
+                return HealthSample(base.fd_total, base.close_wait, base.cpu_percent,
+                    tg_state, failures,
+                    "tripped" if self._restart_task_started else "closed", backoff)
+
+            def _notice(message: str) -> None:
+                loop = self._gateway_loop
+                if loop is not None and not loop.is_closed():
+                    loop.call_soon_threadsafe(lambda: asyncio.create_task(
+                        self._send_health_degraded_notice(message)))
+
+            def _restart() -> None:
+                loop = self._gateway_loop
+                if loop is not None and not loop.is_closed():
+                    loop.call_soon_threadsafe(self.request_restart)
+
+            self._health_gate = HealthGate(_health_cfg, sampler=_runtime_health_sample,
+                notice_callback=_notice, restart_callback=_restart)
+            self._health_gate.start()
+        except Exception:
+            self._health_gate = None
+            logger.warning("[HEALTH] monitor unavailable; gate fails open", exc_info=True)
+
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
         # other background tasks during stop(). Best-effort — a liveness probe
@@ -12529,6 +12575,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         service_restart: bool = False,
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
+        try:
+            if self._health_gate is not None:
+                self._health_gate.stop()
+        except Exception:
+            pass
         # getattr-guard: shutdown-path tests build bare runners via
         # object.__new__ that lack the liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
@@ -21127,6 +21178,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         finally:
             notify_path.unlink(missing_ok=True)
+
+    async def _send_health_degraded_notice(self, message: str) -> None:
+        """Best-effort Telegram notice; health-gate deduplication is upstream."""
+        try:
+            platform = Platform.TELEGRAM
+            platform_cfg = self.config.platforms.get(platform)
+            home = platform_cfg.home_channel if platform_cfg is not None else None
+            adapter = self.adapters.get(platform)
+            if adapter is not None and home is not None and home.chat_id:
+                await adapter.send(str(home.chat_id), message)
+        except Exception:
+            logger.debug("[HEALTH] degraded notice delivery failed", exc_info=True)
 
     async def _send_home_channel_startup_notifications(
         self,

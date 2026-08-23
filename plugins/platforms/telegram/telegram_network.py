@@ -76,6 +76,12 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         self._fallback_lock = asyncio.Lock()
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
+        self._consecutive_fallback_failures = 0
+
+    @property
+    def consecutive_fallback_failures(self) -> int:
+        """Failures since the last successful fallback request (health telemetry)."""
+        return self._consecutive_fallback_failures
 
     async def _get_fallback(self, ip: str) -> httpx.AsyncHTTPTransport:
         async with self._fallback_lock:
@@ -120,6 +126,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
+                if ip is not None:
+                    self._consecutive_fallback_failures = 0
                 if ip is not None and self._sticky_ip != ip:
                     async with self._sticky_lock:
                         if self._sticky_ip != ip:
@@ -138,6 +146,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 # Discard any failed fallback pool before deciding whether the
                 # error itself is retryable.
                 if ip is not None:
+                    self._consecutive_fallback_failures += 1
                     await self._reset_fallback(ip)
                 if not _is_retryable_connect_error(exc):
                     raise

@@ -1474,6 +1474,15 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
+                # Runtime health gate pauses only NEW long work. Existing
+                # workers, notifier delivery, and Telegram remain untouched.
+                from gateway.health_gate import health_gate_allows_long_work
+                if not health_gate_allows_long_work(getattr(self, "_health_gate", None)):
+                    slept = 0.0
+                    while slept < interval and self._running:
+                        await asyncio.sleep(min(1.0, interval - slept))
+                        slept += 1.0
+                    continue
                 # Re-read the auto-decompose toggle live each tick so a user
                 # flipping kanban.auto_decompose=false to STOP runaway fan-out
                 # takes effect on the next tick, not on gateway restart (#49638).
