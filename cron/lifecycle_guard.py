@@ -101,7 +101,133 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     if not text:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    normalized = _mask_literal_data_quotes(normalized)
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+
+
+_OPERATOR_CHARS = frozenset("|&;<>()")
+_LITERAL_DATA_COMMANDS = frozenset({"printf", "echo"})
+_SEGMENT_BREAK_TOKENS = frozenset({"|", "&", ";"})
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _tokenize_shell_like(text: str):
+    """Char-level, quote-aware tokenizer ported from ~/.claude/hooks/tokenizer.js.
+
+    Yields (token_text, quoted, opaque, start, end). ``quoted`` means the
+    token is entirely a single- or double-quoted literal (data the shell
+    never reinterprets as code). ``opaque`` means command substitution
+    ($()/<()/backticks) or an unclosed quote — the bias is always toward
+    "can't tell", which callers must scan conservatively (never mask an
+    opaque token; fail closed, same as the JS original).
+    """
+    out = []
+    i, n = 0, len(text)
+    cur = []
+    cur_start = None
+    cur_quoted = False
+    quote_char = ""
+    cur_opaque = False
+
+    def flush():
+        nonlocal cur, cur_start, cur_quoted, quote_char, cur_opaque
+        if cur_start is None:
+            return
+        out.append(("".join(cur), cur_quoted and not cur_opaque, cur_opaque, cur_start, i))
+        cur, cur_start, cur_quoted, quote_char, cur_opaque = [], None, False, "", False
+
+    while i < n:
+        ch = text[i]
+
+        if cur_opaque:
+            close = (
+                (cur[:1] == ["`"] and ch == "`")
+                or (cur[:2] == ["$", "("] and ch == ")")
+                or (cur[:2] == ["<", "("] and ch == ")")
+            )
+            cur.append(ch)
+            i += 1
+            if close:
+                out.append(("".join(cur), False, True, cur_start, i))
+                cur, cur_start, cur_opaque = [], None, False
+            continue
+
+        if ch == "$" and i + 1 < n and text[i + 1] == "(":
+            flush(); cur, cur_start, cur_opaque = ["$", "("], i, True; i += 2; continue
+        if ch == "<" and i + 1 < n and text[i + 1] == "(":
+            flush(); cur, cur_start, cur_opaque = ["<", "("], i, True; i += 2; continue
+        if ch == "`":
+            flush(); cur, cur_start, cur_opaque = ["`"], i, True; i += 1; continue
+
+        if ch in ("'", '"'):
+            if cur_quoted:
+                if quote_char == ch:
+                    cur.append(ch); i += 1
+                    out.append(("".join(cur), True, False, cur_start, i))
+                    cur, cur_start, cur_quoted, quote_char = [], None, False, ""
+                    continue
+                cur.append(ch); i += 1; continue
+            if cur_start is None:
+                cur_start = i
+            cur.append(ch); cur_quoted, quote_char = True, ch; i += 1; continue
+
+        if ch == "\\":
+            if cur_start is None:
+                cur_start = i
+            if i + 1 < n:
+                cur.append(ch); cur.append(text[i + 1]); i += 2; continue
+            cur.append(ch); i += 1; continue
+
+        if ch.isspace() or ch in _OPERATOR_CHARS:
+            if cur_quoted and not cur_opaque:
+                cur.append(ch); i += 1; continue
+            flush()
+            if not ch.isspace():
+                out.append((ch, False, False, i, i + 1))
+            i += 1
+            continue
+
+        if cur_start is None:
+            cur_start = i
+        cur.append(ch)
+        i += 1
+
+    if cur_quoted:
+        out.append(("".join(cur), False, True, cur_start, n))
+    else:
+        flush()
+    return out
+
+
+def _mask_literal_data_quotes(command: str) -> str:
+    """Blank quoted arguments to ``printf``/``echo`` before lifecycle scanning.
+
+    Those two builtins only ever print their arguments — they never execute
+    them as shell code — so ``printf 'SYMPTOM: ... hermes gateway restart
+    ...' | fixindex fi`` is inert log data, not a lifecycle command, and must
+    not trip the guard (recurring false positive, fixindex 0441). Every other
+    command that *can* turn a string into code (``sh -c``, ``eval``,
+    ``python3 -c``, ...) is left fully scanned as raw text — this only
+    narrows the printf/echo case, it does not weaken the guard elsewhere.
+    """
+    chars = list(command)
+    head = None
+    expect_head = True
+    for tok_text, quoted, opaque, start, end in _tokenize_shell_like(command):
+        if tok_text in _SEGMENT_BREAK_TOKENS:
+            head, expect_head = None, True
+            continue
+        if tok_text in ("(", ")"):
+            continue
+        if expect_head and not quoted and not opaque:
+            if _ENV_ASSIGNMENT.match(tok_text):
+                continue
+            head, expect_head = Path(tok_text).name, False
+            continue
+        if quoted and head in _LITERAL_DATA_COMMANDS:
+            for pos in range(start, end):
+                chars[pos] = " "
+    return "".join(chars)
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -174,8 +300,15 @@ def contains_launchctl_submit_command(command: str) -> bool:
     return False
 
 
-def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optional[Path]:
+    try:
+        path = Path(candidate).expanduser()
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte in a
+        # path tokenized out of a decoded binary's contents (#76762, first
+        # crash point — see also _read_referenced_script). A guarded path
+        # must never crash the guard.
+        return None
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path
@@ -196,7 +329,9 @@ def _iter_referenced_shell_scripts(
 
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:
-                yield _resolve_terminal_script_path(segment[index + 1], cwd)
+                resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
+                if resolved is not None:
+                    yield resolved
             continue
 
         if executable_name in _SHELL_EXECUTABLES:
@@ -220,7 +355,9 @@ def _iter_referenced_shell_scripts(
                 "-c",
                 "--command",
             }:
-                yield _resolve_terminal_script_path(arguments[arg_index], cwd)
+                resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
+                if resolved is not None:
+                    yield resolved
             continue
 
         # A bare "/" token is pathlib's division operator in Python sources
@@ -230,7 +367,9 @@ def _iter_referenced_shell_scripts(
         # (#77131). Skip pure-separator tokens.
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                yield _resolve_terminal_script_path(executable, cwd)
+                resolved = _resolve_terminal_script_path(executable, cwd)
+                if resolved is not None:
+                    yield resolved
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -374,7 +513,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
 
 
 
-def _resolve_script_path(script_path: str) -> Path:
+def _resolve_script_path(script_path: str) -> Optional[Path]:
     """Resolve a cron ``script`` value the same way the scheduler does.
 
     The scheduler (``cron.scheduler``) resolves a bare/relative script path
@@ -384,10 +523,17 @@ def _resolve_script_path(script_path: str) -> Path:
     (``~/.hermes/scripts/restart.sh``) but is passed as the bare name
     ``restart.sh`` would read as a nonexistent relative path and silently
     scan prompt-only content, letting the command through.
+
+    Returns ``None`` on an unresolvable path (embedded NUL byte, the same
+    #76762 crash class as ``_resolve_terminal_script_path`` — a guarded path
+    must never crash the guard); callers treat that as fail-closed/unsafe.
     """
     from hermes_constants import get_hermes_home
 
-    raw = Path(script_path).expanduser()
+    try:
+        raw = Path(script_path).expanduser()
+    except (OSError, ValueError):
+        return None
     if raw.is_absolute():
         return raw
     return get_hermes_home() / "scripts" / raw
@@ -400,7 +546,10 @@ def _read_script_for_scanning(script_path: str) -> str:
     sentinel, while missing/unreadable paths remain empty so ordinary scheduler
     path validation can report them.
     """
-    script_text, unsafe = _read_referenced_script(_resolve_script_path(script_path))
+    resolved = _resolve_script_path(script_path)
+    if resolved is None:
+        return "hermes gateway restart"
+    script_text, unsafe = _read_referenced_script(resolved)
     if unsafe:
         return "hermes gateway restart"
     return script_text or ""
@@ -425,7 +574,8 @@ def check_gateway_lifecycle(
     combined = prompt or ""
     python_script = False
     if script:
-        python_script = _resolve_script_path(script).suffix == ".py"
+        resolved_script = _resolve_script_path(script)
+        python_script = resolved_script is not None and resolved_script.suffix == ".py"
         script_text = _read_script_for_scanning(script)
         if script_text:
             combined = f"{combined}\n{script_text}"
