@@ -3992,7 +3992,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # line) so the weekly audit has allow/rewrite/block/guard_error counts.
         job_name = job.get("name", job["id"])
         _guard_state = "produced"
-        if final_response and _get_hermes_home().name == "koko":
+        # no_agent job 的輸出是人工寫死的腳本 stdout，不是 LLM 生成的人設語句。
+        # 讓審核 LLM 碰它只有風險沒有價值（2026-08-25 water-reminder 事件）。
+        if final_response and _get_hermes_home().name == "koko" and not job.get("no_agent"):
             try:
                 import sys as _sys
                 _guard_dir = str(_get_hermes_home() / "cron")
