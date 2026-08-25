@@ -4100,6 +4100,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
+                # C2: agent 以 [SILENT] 靜默 = 執行完成但無可推播產出。
+                # 等同「空 response」語意 —— 不得記 ok（工單 C2 step 4:
+                # [SILENT] 必須 degraded/failed, watchdog 也不許冒充 primary success）。
+                # success 設 False → mark_job_run 寫非 ok status。
+                success = False
 
             if should_deliver:
                 unresolved_origin = (

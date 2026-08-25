@@ -948,6 +948,22 @@ class TestSilentDelivery:
         deliver_mock.assert_called_once()
 
 
+    def test_silent_response_success_flag_false_via_tick(self, caplog):
+        """端到端：tick + run_job 回 SILENT_MARKER 時, mark_job_run 收到
+        success=False（非 ok）。"""
+        calls = {}
+        def _capture_mark(job_id, success, error=None, delivery_error=None):
+            calls["success"] = success
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", SILENT_MARKER, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run", side_effect=_capture_mark):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        assert calls.get("success") is False
+
+
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
