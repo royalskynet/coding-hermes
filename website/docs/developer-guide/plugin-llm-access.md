@@ -273,8 +273,12 @@ against your schema if `jsonschema` is installed.
 
 * `result.content_type == "json"` — `result.parsed` is a Python
   object that matches your schema.
-* `result.content_type == "text"` — parsing or validation failed;
-  inspect `result.text` for the raw model response.
+* `result.content_type == "text"` — parsing failed; the model output
+  did not parse as JSON. Inspect `result.text` for the raw model
+  response. (Schema validation failure is a different path: when
+  `jsonschema` is installed and an output violates the schema,
+  `complete_structured` raises `ValueError` instead of returning a
+  `"text"` result — see `_parse_structured_text`.)
 
 ### Async
 

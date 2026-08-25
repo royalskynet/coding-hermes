@@ -173,6 +173,14 @@ class _TrustPolicy:
     allow_any_model: bool = False  # True when allowed_models == ["*"]
     allow_agent_id_override: bool = False
     allow_profile_override: bool = False
+    # Optional default leg for plugin-originated completion calls that do
+    # not pass an explicit provider/model. When set, plugin background calls
+    # (compression, structured output, ...) stay pinned to this free leg
+    # instead of following the user's chat model — decoupling passive /
+    # scheduled calls from the interactive model selection. Absent when the
+    # plugin does not configure one (falls through to host auto-resolve).
+    default_provider: Optional[str] = None
+    default_model: Optional[str] = None
 
 
 def _normalize_ref(raw: str) -> str:
@@ -197,6 +205,18 @@ def _coerce_allowlist(raw: Any) -> tuple[Optional[frozenset], bool]:
     if cleaned:
         return frozenset(cleaned), allow_any
     return frozenset(), allow_any
+
+
+def _clean_optional_str(raw: Any) -> Optional[str]:
+    """Coerce a config value to a stripped non-empty string or ``None``.
+
+    Empty / non-string values resolve to ``None`` so a missing plugin-level
+    ``provider`` / ``model`` key leaves the trust policy without a default leg
+    (falls through to host auto-resolve)."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    return cleaned or None
 
 
 def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
@@ -243,6 +263,11 @@ def _resolve_trust_policy(plugin_id: str) -> _TrustPolicy:
         allow_any_model=allow_any_model,
         allow_agent_id_override=bool(llm_cfg.get("allow_agent_id_override", False)),
         allow_profile_override=bool(llm_cfg.get("allow_profile_override", False)),
+        # Plugin-pinned default leg: background / scheduled plugin calls that
+        # do not pass an explicit provider or model stay on this free leg
+        # instead of inheriting the user's interactive chat model.
+        default_provider=_clean_optional_str(llm_cfg.get("provider")),
+        default_model=_clean_optional_str(llm_cfg.get("model")),
     )
 
 
@@ -325,6 +350,18 @@ def _check_overrides(
                 f"to true to allow)."
             )
         final_profile = requested_profile.strip()
+
+    # Plugin-pinned default leg: when the caller did not request an explicit
+    # provider/model, apply the plugin's configured default (if any). This is
+    # what decouples background / scheduled plugin calls from the user's
+    # interactive chat model — e.g. weekly_retro stays on its free leg even
+    # if the host model is switched to a paid one. The default is trusted
+    # implicitly (it is operator-configured for this plugin), so it does not
+    # go through the allowlist gate.
+    if not final_provider:
+        final_provider = policy.default_provider
+    if not final_model:
+        final_model = policy.default_model
 
     return final_provider, final_model, requested_agent_id, final_profile
 
@@ -443,6 +480,57 @@ def _build_structured_messages(
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
 
+# Providers whose OpenAI-compatible wire rejects a ``json_schema`` typed
+# ``response_format`` (or does not honor it). Populated from P0-2 probing
+# (NVIDIA NIM and some small :free variants fall back to JSON text rather
+# than strict schema). Extend as new free legs are probed.
+_JSON_SCHEMA_UNSUPPORTED: frozenset[str] = frozenset()
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """Pull the first complete JSON object/array out of ``text``.
+
+    Tolerant of surrounding prose, markdown bullets, and trailing text.
+    Scans every candidate substring between an opening ``{``/``[`` and its
+    matching close using the stdlib JSON tokenizer, returning the first
+    successfully parsed payload (re-serialized) or ``None`` when none
+    parses.
+    """
+    for start, open_ch, close_ch in (
+        (ii, ch, "}" if ch == "{" else "]")
+        for ii, ch in enumerate(text)
+        if ch in "[{"
+    ):
+        depth = 0
+        in_str = False
+        esc = False
+        for jj in range(start, len(text)):
+            c = text[jj]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : jj + 1]
+                    try:
+                        json.loads(candidate)
+                    except (json.JSONDecodeError, ValueError):
+                        break
+                    return candidate
+            if depth < 0:
+                break
+    return None
+
 
 def _strip_code_fences(text: str) -> str:
     """Pull the first fenced code block out of ``text`` if any. Returns
@@ -465,7 +553,16 @@ def _parse_structured_text(
         return None, "text"
 
     try:
-        parsed = json.loads(_strip_code_fences(text))
+        cleaned = _strip_code_fences(text)
+        try:
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            # Second pass: pull the first complete JSON object/array out of
+            # prose-wrapped output (P2-3 step 2).
+            candidate = _extract_first_json_object(cleaned)
+            if candidate is None:
+                return None, "text"
+            parsed = json.loads(candidate)
     except (json.JSONDecodeError, ValueError):
         return None, "text"
 
@@ -724,31 +821,68 @@ class PluginLlm:
             requested_profile=profile,
         )
 
-        messages = _build_structured_messages(
-            instructions=instructions,
-            inputs=list(input),
+        extra_body = self._json_response_format(
             json_mode=json_mode,
             json_schema=json_schema,
             schema_name=schema_name,
-            system_prompt=system_prompt,
+            provider=eff_provider,
         )
-        extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
 
-        real_provider, real_model, response = self._invoke_sync(
-            messages=messages,
-            provider_override=eff_provider,
-            model_override=eff_model,
-            profile_override=eff_profile,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=extra_body,
-        )
-        text = _extract_text(response)
-        usage = _extract_usage(response)
-        parsed, content_type = _parse_structured_text(
-            text=text, json_mode=json_mode, json_schema=json_schema
-        )
+        parsed: Optional[Any] = None
+        content_type = "text"
+        real_provider = eff_provider or ""
+        real_model = eff_model or ""
+        text = ""
+        usage = PluginLlmUsage()
+        current_instructions = instructions
+        for _attempt in range(3):
+            messages = _build_structured_messages(
+                instructions=current_instructions,
+                inputs=list(input),
+                json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
+                system_prompt=system_prompt,
+            )
+            invoked_provider, invoked_model, response = self._invoke_sync(
+                messages=messages,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=extra_body,
+            )
+            if invoked_provider:
+                real_provider = invoked_provider
+            if invoked_model:
+                real_model = invoked_model
+            text = _extract_text(response)
+            usage = _extract_usage(response)
+            try:
+                parsed, content_type = _parse_structured_text(
+                    text=text, json_mode=json_mode, json_schema=json_schema
+                )
+            except ValueError:
+                # Schema validation failed (P2-3 step 3): strengthen the JSON
+                # directive and retry, up to 3 attempts.
+                if _attempt >= 2:
+                    raise
+                current_instructions += (
+                    "\n\nA previous response failed schema validation. "
+                    "Respond with ONLY a single valid JSON object that exactly "
+                    "matches the requested schema — no prose, no markdown fences."
+                )
+                continue
+            if parsed is not None:
+                break
+            if _attempt >= 2:
+                break
+            current_instructions += (
+                "\n\nYour previous response did not parse as JSON. "
+                "Reply with ONLY a single JSON object — no prose, no markdown."
+            )
         result = PluginLlmStructuredResult(
             text=text,
             provider=real_provider,
@@ -852,30 +986,66 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
-        messages = _build_structured_messages(
-            instructions=instructions,
-            inputs=list(input),
+        extra_body = self._json_response_format(
             json_mode=json_mode,
             json_schema=json_schema,
             schema_name=schema_name,
-            system_prompt=system_prompt,
+            provider=eff_provider,
         )
-        extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
-        real_provider, real_model, response = await self._invoke_async(
-            messages=messages,
-            provider_override=eff_provider,
-            model_override=eff_model,
-            profile_override=eff_profile,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=extra_body,
-        )
-        text = _extract_text(response)
-        usage = _extract_usage(response)
-        parsed, content_type = _parse_structured_text(
-            text=text, json_mode=json_mode, json_schema=json_schema
-        )
+
+        parsed: Optional[Any] = None
+        content_type = "text"
+        real_provider = eff_provider or ""
+        real_model = eff_model or ""
+        text = ""
+        usage = PluginLlmUsage()
+        current_instructions = instructions
+        for _attempt in range(3):
+            messages = _build_structured_messages(
+                instructions=current_instructions,
+                inputs=list(input),
+                json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
+                system_prompt=system_prompt,
+            )
+            invoked_provider, invoked_model, response = await self._invoke_async(
+                messages=messages,
+                provider_override=eff_provider,
+                model_override=eff_model,
+                profile_override=eff_profile,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=extra_body,
+            )
+            if invoked_provider:
+                real_provider = invoked_provider
+            if invoked_model:
+                real_model = invoked_model
+            text = _extract_text(response)
+            usage = _extract_usage(response)
+            try:
+                parsed, content_type = _parse_structured_text(
+                    text=text, json_mode=json_mode, json_schema=json_schema
+                )
+            except ValueError:
+                if _attempt >= 2:
+                    raise
+                current_instructions += (
+                    "\n\nA previous response failed schema validation. "
+                    "Respond with ONLY a single valid JSON object that exactly "
+                    "matches the requested schema — no prose, no markdown fences."
+                )
+                continue
+            if parsed is not None:
+                break
+            if _attempt >= 2:
+                break
+            current_instructions += (
+                "\n\nYour previous response did not parse as JSON. "
+                "Reply with ONLY a single JSON object — no prose, no markdown."
+            )
         return PluginLlmStructuredResult(
             text=text,
             provider=real_provider,
@@ -896,23 +1066,37 @@ class PluginLlm:
 
     @staticmethod
     def _json_response_format(
-        *, json_mode: bool, json_schema: Optional[Any]
+        *,
+        json_mode: bool,
+        json_schema: Optional[Any],
+        schema_name: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build the ``extra_body.response_format`` payload for the
-        provider request. Falls back to ``json_object`` when no schema
-        is given so providers that ignore json_schema still get a hint."""
-        if json_schema is not None:
+        provider request.
+
+        Preference: if ``json_schema`` is given AND the resolved provider
+        is known to support ``json_schema`` response_format, emit that
+        (using the caller's ``schema_name`` as the wire name). Providers
+        that reject ``json_schema`` (or are unknown/unsupported, tracked
+        in ``_JSON_SCHEMA_UNSUPPORTED``) degrade to ``json_object`` so the
+        request still succeeds; schema enforcement is then done client-side
+        by ``_parse_structured_text``'s jsonschema validation. Falls back
+        to ``json_object`` when only ``json_mode`` is set, or ``None``
+        when no structured output is requested.
+        """
+        if json_schema is not None and provider not in _JSON_SCHEMA_UNSUPPORTED:
             return {
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "plugin_structured_output",
+                        "name": schema_name or "plugin_structured_output",
                         "schema": json_schema,
                         "strict": False,
                     },
                 }
             }
-        if json_mode:
+        if json_mode or json_schema is not None:
             return {"response_format": {"type": "json_object"}}
         return None
 

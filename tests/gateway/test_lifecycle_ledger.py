@@ -67,12 +67,27 @@ def _exit_diag_records(home: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="/proc is Linux-only")
-def test_sample_memory_has_expected_keys_on_linux() -> None:
+@pytest.mark.skipif(
+    sys.platform not in ("linux", "darwin"),
+    reason="memory sampling is implemented for Linux (/proc) and macOS (psutil)",
+)
+def test_sample_memory_has_expected_keys_on_native_platform() -> None:
     sample = sample_memory()
     assert sample.get("rss_kib", 0) > 0
     assert sample.get("mem_total_kib", 0) > 0
     assert "mem_available_kib" in sample
+    assert sample["mem_available_kib"] > 0
+    assert "swap_used_kib" in sample
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS psutil sample")
+def test_sample_memory_darwin_returns_real_values() -> None:
+    sample = sample_memory()
+    # psutil kiB conversions must be sane on darwin — 256 MiB machine floor.
+    assert sample.get("rss_kib", 0) >= 0
+    assert sample.get("mem_total_kib", 0) > 256 * 1024
+    assert sample.get("mem_available_kib", 0) > 0
+    assert sample.get("swap_used_kib", 0) >= 0
 
 
 # ---------------------------------------------------------------------------

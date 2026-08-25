@@ -265,6 +265,34 @@ class TestJsonParsing:
         assert ct == "json"
 
 
+    def test_parse_structured_text_returns_none_on_malformed_json(self):
+        """餵壞 JSON → parsed=None 且 content_type='text'，且不拋例外。"""
+        parsed, ct = _parse_structured_text(
+            text="{this is not valid json",
+            json_mode=True,
+            json_schema=None,
+        )
+        assert parsed is None
+        assert ct == "text"
+
+
+    def test_parse_structured_text_raises_on_schema_mismatch(self):
+        # 合法 JSON 但違反 schema → 拋 ValueError（jsonschema ValidationError 轉化）
+        pytest.importorskip("jsonschema")
+        schema = {
+            "type": "object",
+            "properties": {"language": {"type": "string"}},
+            "required": ["language"],
+            "additionalProperties": False,
+        }
+        with pytest.raises(ValueError):
+            _parse_structured_text(
+                text='{"language": 123}',  # 非字串，違規
+                json_mode=False,
+                json_schema=schema,
+            )
+
+
 # ---------------------------------------------------------------------------
 # End-to-end facade
 # ---------------------------------------------------------------------------

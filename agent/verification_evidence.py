@@ -627,23 +627,83 @@ def verification_status(
         changed_paths = []
 
     if event is None:
-        return {
-            "status": "unverified",
-            "evidence": None,
-            "root": root,
-            "session_id": sid,
-            "changed_paths": changed_paths,
-        }
+        return _finalize_status(
+            sid=sid,
+            root=root,
+            status="unverified",
+            evidence=None,
+            changed_paths=changed_paths,
+            facts=facts,
+        )
 
     evidence = dict(event)
     if state["last_edit_at"] and state["last_edit_at"] > evidence["created_at"]:
         status = "stale"
     else:
         status = evidence["status"]
-    return {
+    return _finalize_status(
+        sid=sid,
+        root=root,
+        status=status,
+        evidence=evidence,
+        changed_paths=changed_paths,
+        facts=facts,
+    )
+
+
+def _finalize_status(
+    *,
+    sid: str,
+    root: str,
+    status: str,
+    evidence: Optional[dict[str, Any]],
+    changed_paths: list[str],
+    facts: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply an ad-hoc session-level fallback for repos with no canonical
+    verify command.
+
+    When a single turn edits multiple repo roots, a passing ad-hoc
+    ``hermes-verify-*`` script is recorded against one root (the cwd where the
+    command ran), leaving sibling edited roots ``unverified``. For a repo with
+    no canonical ``verifyCommands``, the only verification gate is ad-hoc, so
+    any passing ad-hoc script run earlier in the same session covers it too.
+    Canonical-command repos are left untouched — they must still prove a real
+    canonical run.
+    """
+    base = {
         "status": status,
         "evidence": evidence,
         "root": root,
         "session_id": sid,
         "changed_paths": changed_paths,
     }
+    if status == "passed":
+        return base
+    verify_commands = (facts or {}).get("verifyCommands") or []
+    if verify_commands:
+        # Canonical-command repo: ad-hoc does not relax the gate.
+        return base
+    # ad-hoc fallback: any passing ad-hoc script this session covers the turn.
+    with _DB_LOCK:
+        row = None
+        try:
+            with _transaction() as conn:
+                row = conn.execute(
+                    """
+                    SELECT * FROM verification_events
+                    WHERE session_id = ?
+                      AND kind = 'ad_hoc'
+                      AND status = 'passed'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (sid,),
+                ).fetchone()
+        except Exception:
+            row = None
+    if row is None:
+        return base
+    base["status"] = "passed"
+    base["evidence"] = dict(row)
+    return base

@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,36 +78,52 @@ def get_lifecycle_sentinel_path(home: Optional[Path] = None) -> Path:
 def sample_memory() -> Dict[str, Any]:
     """Cheap memory snapshot: own RSS + system availability + swap.
 
-    Pure ``/proc`` reads, Linux-only (returns ``{}`` elsewhere), never
-    raises.  Values in KiB to match the kernel's units.
+    Linux: pure ``/proc`` reads.  macOS: psutil (RSS from ``ps``, memory
+    from ``vm_stat``/``sysctl``).  Never raises — returns ``{}`` when the
+    platform's source is unavailable.  Values in KiB to match the
+    kernel's units.
     """
     sample: Dict[str, Any] = {}
-    try:
-        with open("/proc/self/status", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    sample["rss_kib"] = int(line.split()[1])
-                    break
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        meminfo: Dict[str, int] = {}
-        wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
-        with open("/proc/meminfo", encoding="utf-8") as fh:
-            for line in fh:
-                key = line.split(":", 1)[0]
-                if key in wanted:
-                    meminfo[key] = int(line.split()[1])
-                    if len(meminfo) == len(wanted):
+    if sys.platform == "linux":
+        try:
+            with open("/proc/self/status", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        sample["rss_kib"] = int(line.split()[1])
                         break
-        if "MemTotal" in meminfo:
-            sample["mem_total_kib"] = meminfo["MemTotal"]
-        if "MemAvailable" in meminfo:
-            sample["mem_available_kib"] = meminfo["MemAvailable"]
-        if "SwapTotal" in meminfo and "SwapFree" in meminfo:
-            sample["swap_used_kib"] = meminfo["SwapTotal"] - meminfo["SwapFree"]
-    except (OSError, ValueError, IndexError):
-        pass
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            meminfo: Dict[str, int] = {}
+            wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+            with open("/proc/meminfo", encoding="utf-8") as fh:
+                for line in fh:
+                    key = line.split(":", 1)[0]
+                    if key in wanted:
+                        meminfo[key] = int(line.split()[1])
+                        if len(meminfo) == len(wanted):
+                            break
+            if "MemTotal" in meminfo:
+                sample["mem_total_kib"] = meminfo["MemTotal"]
+            if "MemAvailable" in meminfo:
+                sample["mem_available_kib"] = meminfo["MemAvailable"]
+            if "SwapTotal" in meminfo and "SwapFree" in meminfo:
+                sample["swap_used_kib"] = meminfo["SwapTotal"] - meminfo["SwapFree"]
+        except (OSError, ValueError, IndexError):
+            pass
+    elif sys.platform == "darwin":
+        try:
+            import psutil
+
+            sample["source"] = "psutil"
+            sample["rss_kib"] = psutil.Process().memory_info().rss // 1024
+            vm = psutil.virtual_memory()
+            sample["mem_total_kib"] = vm.total // 1024
+            sample["mem_available_kib"] = vm.available // 1024
+            swap = psutil.swap_memory()
+            sample["swap_used_kib"] = swap.used // 1024
+        except Exception:  # pragma: no cover — psutil import/read failure
+            pass
     return sample
 
 

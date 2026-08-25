@@ -210,3 +210,71 @@ def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):
     assert result is not None, (
         "Windows backslash path should be matched via posix=False fallback"
     )
+
+
+def _git_root_project(root: Path) -> None:
+    """Empty .git dir makes ``project_facts_for`` treat ``root`` as an
+    independent git workspace with no canonical verify commands."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".git").mkdir()
+    (root / "code.py").write_text("x = 1\n", encoding="utf-8")
+
+
+def test_ad_hoc_session_evidence_covers_sibling_no_canonical_root(tmp_path, monkeypatch):
+    """A single turn editing two roots is fully verified once one of them runs
+    a passing ad-hoc ``hermes-verify-*`` script. Both roots have no canonical
+    verify command, so the ad-hoc pass covers the sibling root too (#ad-hoc)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    root_a = tmp_path / "rootA"
+    root_b = tmp_path / "rootB"
+    for r in (root_a, root_b):
+        _git_root_project(r)
+
+    script = tmp_path / "hermes-verify-x.py"
+    script.write_text("assert True\n", encoding="utf-8")
+
+    sid = "sess-multiroot"
+    mark_workspace_edited(session_id=sid, cwd=root_a, paths=[str(root_a / "code.py")])
+    mark_workspace_edited(session_id=sid, cwd=root_b, paths=[str(root_b / "code.py")])
+
+    rec = record_terminal_result(
+        command=f"python3 {script}",
+        cwd=root_a,
+        session_id=sid,
+        exit_code=0,
+        output="PASS",
+    )
+    assert rec is not None and rec["kind"] == "ad_hoc" and rec["status"] == "passed"
+
+    assert verification_status(session_id=sid, cwd=root_b)["status"] == "passed"
+
+
+def test_ad_hoc_does_not_relax_canonical_root(tmp_path, monkeypatch):
+    """A canonical-command repo must NOT be relaxed to passed by a passing
+    ad-hoc script in the same session — it must prove a real canonical run."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    root_a = tmp_path / "rootA"
+    _git_root_project(root_a)
+    root_c = tmp_path / "rootC"  # canonical repo (has verifyCommands)
+    root_c.mkdir()
+    (root_c / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+
+    script = tmp_path / "hermes-verify-x.py"
+    script.write_text("assert True\n", encoding="utf-8")
+
+    sid = "sess-canonical"
+    mark_workspace_edited(session_id=sid, cwd=root_a, paths=[str(root_a / "code.py")])
+    mark_workspace_edited(session_id=sid, cwd=root_c, paths=[str(root_c / "pyproject.toml")])
+
+    rec = record_terminal_result(
+        command=f"python3 {script}",
+        cwd=root_a,
+        session_id=sid,
+        exit_code=0,
+        output="PASS",
+    )
+    assert rec is not None and rec["kind"] == "ad_hoc" and rec["status"] == "passed"
+
+    # canonical root must stay unverified — ad-hoc does not relax it
+    status = verification_status(session_id=sid, cwd=root_c)
+    assert status["status"] != "passed"

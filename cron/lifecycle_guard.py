@@ -43,6 +43,8 @@ import stat
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
+from tools.shell_masking import _mask_heredoc_bodies
+
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,10 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     normalized = _mask_literal_data_quotes(normalized)
+    # A heredoc body is data, not a lifecycle command: blank it before the
+    # pattern scan so ``hermes gateway restart`` living inside a here-document
+    # is not mistaken for an actual restart request (false positive GUARD-2/3).
+    normalized = _mask_heredoc_bodies(normalized)
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
 
 
@@ -303,11 +309,14 @@ def contains_launchctl_submit_command(command: str) -> bool:
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optional[Path]:
     try:
         path = Path(candidate).expanduser()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         # OSError: unreadable/long paths. ValueError: embedded NUL byte in a
         # path tokenized out of a decoded binary's contents (#76762, first
-        # crash point — see also _read_referenced_script). A guarded path
-        # must never crash the guard.
+        # crash point — see also _read_referenced_script). RuntimeError:
+        # expanduser cannot determine the home directory in a stripped
+        # sandbox runtime (no HOME in env) — the guard must never crash,
+        # whatever the environment looks like. A guarded path must never
+        # crash the guard.
         return None
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path

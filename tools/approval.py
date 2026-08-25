@@ -25,6 +25,7 @@ from typing import Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
+from tools.shell_masking import _mask_heredoc_bodies
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -2101,7 +2102,9 @@ def _command_detection_variants(command: str):
     # unterminated quote), so masking the normalized text could swallow a
     # REAL unquoted newline separator that follows. The raw command carries
     # faithful shell quote state.
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+    normalized = _normalize_command_for_detection(
+        _mask_quoted_newlines(_mask_heredoc_bodies(command))
+    )
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)

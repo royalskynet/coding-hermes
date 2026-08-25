@@ -16,6 +16,7 @@ from hermes_cli.cron import (
     _contains_gateway_lifecycle_command,
     cron_command,
 )
+from tools.shell_masking import _mask_heredoc_bodies
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,135 @@ class TestGatewayLifecyclePattern:
     ])
     def test_safe_commands(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
+
+
+class TestHeredocDataMasking:
+    """A heredoc body is data, not code: it must never trip the lifecycle guard.
+
+    Regression for WO-2026-08-25 (GUARD-2/3): ``git rebase --abort`` inside a
+    here-document, and prose containing ``restart gateway``, were falsely
+    blocked because the guard scanned heredoc bodies as if they were executed
+    commands.  The body is blanked by ``_mask_heredoc_bodies`` before the
+    pattern scan.
+    """
+
+    @staticmethod
+    def _plain(text: str) -> str:
+        return "\n".join(line.lstrip() for line in text.strip("\n").splitlines()) + "\n"
+
+    def test_blank_body_of_bare_delimiter(self):
+        masked = _mask_heredoc_bodies('cat <<EOF\nhermes gateway restart\nEOF\n')
+        assert "hermes gateway restart" not in masked
+        assert "cat <<EOF" in masked
+
+    def test_blank_body_of_single_quoted_delimiter(self):
+        masked = _mask_heredoc_bodies("cat <<'EOF'\nhermes gateway restart\nEOF\n")
+        assert "hermes gateway restart" not in masked
+
+    def test_blank_body_of_double_quoted_delimiter(self):
+        masked = _mask_heredoc_bodies('cat <<"EOF"\nhermes gateway restart\nEOF\n')
+        assert "hermes gateway restart" not in masked
+
+    def test_tab_strip_delimiter_variant(self):
+        masked = _mask_heredoc_bodies("cat <<-EOT\nhermes gateway stop\n\tEOT\n")
+        assert "hermes gateway stop" not in masked
+        assert "cat <<-EOT" in masked
+
+    def test_tilde_delimiter_variant(self):
+        masked = _mask_heredoc_bodies("cat <<~EOT\nhermes gateway stop\nEOT\n")
+        assert "hermes gateway stop" not in masked
+
+    def test_delimiter_inside_quotes_is_not_a_heredoc(self):
+        # `<<EOF` inside a quoted string is literal data, not a heredoc start.
+        cmd = 'echo "use <<EOF here"\n'
+        assert _mask_heredoc_bodies(cmd) == cmd
+
+    def test_multiple_heredocs_in_one_command(self):
+        # Two independent heredoc command lines (the common case): each body
+        # is data and must be masked.
+        cmd = (
+            "cat <<A\n"
+            "hermes gateway restart\n"
+            "A\n"
+            "cat <<B\n"
+            "rm -rf /nope\n"
+            "B\n"
+        )
+        masked = _mask_heredoc_bodies(cmd)
+        assert "hermes gateway restart" not in masked
+        assert "rm -rf /nope" not in masked  # both bodies masked
+
+    def test_two_heredocs_share_one_header(self):
+        # One simple-command header may carry two `<<` redirections
+        # (`cat <<A <<'B'`); bodies are read sequentially (A-body then B-body)
+        # and BOTH must be masked — the header's second delimiter must not be
+        # skipped after the first body is found.
+        cmd = (
+            "cat <<A <<'B'\n"
+            "hermes gateway restart\n"
+            "A\n"
+            "rm -rf /nope\n"
+            "B\n"
+        )
+        masked = _mask_heredoc_bodies(cmd)
+        assert "hermes gateway restart" not in masked
+        assert "rm -rf /nope" not in masked  # second body leaked before fix
+        assert "cat <<A <<'B'" in masked     # header still scannable
+
+    def test_shared_header_with_tab_strip_variant(self):
+        cmd = (
+            "cat <<-A <<B\n"
+            "hermes gateway stop\n"
+            "\tA\n"
+            "rm -rf /nope\n"
+            "B\n"
+        )
+        masked = _mask_heredoc_bodies(cmd)
+        assert "hermes gateway stop" not in masked
+        assert "rm -rf /nope" not in masked
+
+    def test_mask_preserves_newlines_and_length(self):
+        # Masking is 1:1 with the source: every non-newline char becomes a
+        # space, all newlines stay in place, byte length and line count match.
+        cmd = (
+            "cat <<A <<'B'\n"
+            "line one\n"
+            "line two\n"
+            "A\n"
+            "third body line\n"
+            "B\n"
+        )
+        masked = _mask_heredoc_bodies(cmd)
+        assert len(masked) == len(cmd)
+        assert masked.count("\n") == cmd.count("\n")
+        for src_ch, masked_ch in zip(cmd, masked):
+            if src_ch == "\n":
+                assert masked_ch == "\n"
+
+    def test_unterminated_heredoc_fails_closed(self):
+        # No terminator: body is left intact so the original scan authority
+        # stays in force (malformed input preserved, not guessed at).
+        cmd = "cat <<EOF\nhermes gateway restart\n"
+        assert _mask_heredoc_bodies(cmd) == cmd
+
+    # --- End-to-end behaviour through the lifecycle guard -------------------
+    def test_pure_data_heredoc_no_longer_blocked(self):
+        text = self._plain(
+            "cat <<'EOF' > /tmp/notes.txt\n"
+            "symptom: hermes gateway restart got blocked\n"
+            "EOF"
+        )
+        assert not _contains_gateway_lifecycle_command(text)
+
+    def test_real_command_before_heredoc_still_blocked(self):
+        text = "hermes gateway restart <<'EOF'\ndata\nEOF\n"
+        assert _contains_gateway_lifecycle_command(text)
+
+    def test_real_command_after_heredoc_still_blocked(self):
+        # A genuine lifecycle command *after* the heredoc body (outside it)
+        # must still trip the guard — masking only blanks the body.
+        text = "cat <<'EOF' > /tmp/x.txt\ndata\nEOF\nhermes gateway restart\n"
+        assert _contains_gateway_lifecycle_command(text)
 
 
 class TestCronCreateLifecycleBlock:
