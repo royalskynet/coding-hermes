@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -183,3 +187,71 @@ def test_prior_exit_label_survives_corrupt_sentinel(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("garbage", encoding="utf-8")
     assert read_prior_exit_label(tmp_path) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# B1 regression: graceful SIGTERM records a clean exit (NS-608 / B1)
+#
+# The gateway wires SIGTERM to the same graceful funnel that ends in
+# ``mark_exited``.  A clean TERM must leave the sentinel ``phase=exited`` so
+# the next boot does NOT report UNCLEANLY.  This guards the precise contract
+# that distinguishes OOM/SIGKILL (unclean) from a normal managed restart.
+# ---------------------------------------------------------------------------
+
+
+def test_sigterm_writes_clean_exit_records(tmp_path: Path) -> None:
+    home = tmp_path
+    agent_repo = Path(__file__).resolve().parents[2]  # repo root
+    stub = r"""
+import json, os, signal, sys, time
+from pathlib import Path
+sys.path.insert(0, os.environ['__syspath__'])
+from gateway.lifecycle_ledger import record_startup, mark_exited
+
+home = Path(os.environ['ISO_HOME'])
+record_startup(home=home)
+print(json.dumps({"ready": True, "pid": os.getpid()}), flush=True)
+signal.signal(signal.SIGTERM,
+              lambda s, f: (mark_exited(0, reason="graceful_shutdown", home=home),
+                            sys.exit(0)))
+deadline = time.time() + 60
+while time.time() < deadline:
+    time.sleep(0.1)
+print(json.dumps({"timeout": True}), flush=True)
+sys.exit(2)
+"""
+    iso_home = tmp_path  # reuse tmp_path; ledger writes go under state/
+    proc = subprocess.Popen(
+        [sys.executable, "-c", stub],
+        env={**os.environ, "ISO_HOME": str(home), "__syspath__": str(agent_repo)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    # Wait for stub to claim the sentinel.
+    deadline = time.time() + 30
+    ready = False
+    while time.time() < deadline:
+        line = proc.stdout.readline() if proc.stdout is not None else ""
+        if line:
+            print("[stub] " + line.rstrip())
+        if '"ready"' in line:
+            ready = True
+            break
+        if proc.poll() is not None:
+            break
+    assert ready, f"stub never became ready (exit={proc.poll()})"
+
+    os.kill(proc.pid, signal.SIGTERM)
+    proc.wait(timeout=20)
+    assert proc.returncode == 0, f"stub exit={proc.returncode}"
+
+    sentinel = _read_sentinel(home)
+    assert sentinel["phase"] == "exited"
+    assert sentinel["pid"] == proc.pid
+    assert sentinel["exit_code"] == 0
+    assert sentinel["exit_reason"] == "graceful_shutdown"
+
+    # A subsequent boot must report nothing (clean), not an unclean death.
+    assert record_startup(home=home) is None
+    assert _exit_diag_records(home) == []
