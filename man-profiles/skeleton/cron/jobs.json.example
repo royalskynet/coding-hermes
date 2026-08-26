@@ -1,0 +1,39 @@
+{
+ "_comment": "cron jobs.json 結構範例（值已脫敏）。實際 jobs.json 由 `hermes -p <profile> cron` 管理。複製此結構到 ~/.hermes/profiles/<name>/cron/jobs.json 後，填 prompt（絕對路徑用 ${PROFILE_DIR}/${HOME}）、schedule、deliver、model/provider。絕對路徑與憑證值不得寫入 repo。",
+ "jobs": [
+  {
+   "id": "<REDACTED-ID>",
+   "name": "example-job-sched",
+   "prompt": "<REDACTED — 任務提示，含絕對路徑時以 ${PROFILE_DIR} 取代>",
+   "skills": [
+    "<skill-name>"
+   ],
+   "skill": "<skill-name>",
+   "model": null,
+   "provider": null,
+   "provider_snapshot": "openrouter",
+   "model_snapshot": "free-tools",
+   "base_url": null,
+   "script": null,
+   "no_agent": false,
+   "context_from": null,
+   "schedule": {
+    "kind": "cron",
+    "expr": "0 6 * * 1",
+    "display": "0 6 * * 1"
+   },
+   "schedule_display": "0 6 * * 1",
+   "repeat": {
+    "times": null,
+    "completed": 0
+   },
+   "enabled": true,
+   "state": "scheduled",
+   "deliver": "telegram",
+   "origin": null,
+   "enabled_toolsets": null,
+   "workdir": null
+  }
+ ],
+ "updated_at": "<REDACTED>"
+}
