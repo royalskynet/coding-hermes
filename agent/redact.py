@@ -283,7 +283,10 @@ def _key_has_secret_keyword(key: str) -> bool:
     return False
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+# Also matches environment-variable style keys like GITHUB_PERSONAL_ACCESS_TOKEN,
+# AWS_SECRET_ACCESS_KEY by allowing any key ending with TOKEN, KEY, SECRET, PASSWORD,
+# or CREDENTIAL.
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material|[A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL))"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,
@@ -995,6 +998,39 @@ def _has_http_method_substring(text: str) -> bool:
     """Cheap pre-check before scanning for access-log request targets."""
     upper = text.upper()
     return any(method in upper for method in _HTTP_METHOD_SUBSTRINGS)
+
+
+def contains_secret_shape(text: str) -> bool:
+    """Check if text contains recognizable credential patterns (prefix, env, JSON field).
+
+    Reuses existing redaction patterns (_PREFIX_PATTERNS, _ENV_ASSIGN_RE, _JSON_FIELD_RE)
+    to detect secret-like shapes without redacting. Used by media delivery guards to
+    reject files containing credential patterns before transmission.
+
+    Args:
+        text: Text to scan for credential shapes.
+
+    Returns:
+        True if any known credential pattern is found, False otherwise.
+    """
+    # Cheap pre-check for known credential prefixes (e.g. ghp_, sk-, AKIA, etc.)
+    if _has_known_prefix_substring(text):
+        # Verify against the full prefix regex to avoid false positives
+        prefix_re = re.compile(
+            r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
+        )
+        if prefix_re.search(text):
+            return True
+
+    # Check for ENV-style assignments (KEY=value, including uppercase secret-like names)
+    if _ENV_ASSIGN_RE.search(text):
+        return True
+
+    # Check for JSON field patterns ("token": "value", etc.)
+    if _JSON_FIELD_RE.search(text):
+        return True
+
+    return False
 
 
 class RedactingFormatter(logging.Formatter):

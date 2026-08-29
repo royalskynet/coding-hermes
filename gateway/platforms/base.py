@@ -23,6 +23,8 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from agent.file_safety import CREDENTIAL_HOME_SUBPATHS
+from agent.redact import contains_secret_shape
 
 logger = logging.getLogger(__name__)
 
@@ -1208,15 +1210,9 @@ _MEDIA_DELIVERY_DENIED_PREFIXES = (
 # Within $HOME we additionally deny common credential / config directories.
 # Resolved at check time against the live $HOME so containers and alt-home
 # setups work correctly.
-_MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
-    ".ssh",
-    ".aws",
-    ".gnupg",
-    ".kube",
-    ".docker",
-    ".config",
-    ".azure",
-    ".gcloud",
+# Credential paths are shared with agent/file_safety.py to prevent drift.
+# Media-delivery-specific denials (e.g. macOS) are added separately.
+_MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = CREDENTIAL_HOME_SUBPATHS + (
     "Library/Keychains",  # macOS
 )
 
@@ -1440,6 +1436,54 @@ def _file_is_recently_produced(resolved: Path, window_seconds: float) -> bool:
     return (time.time() - mtime) <= window_seconds
 
 
+# Media delivery content guard: file extensions to scan for credential shapes,
+# and maximum file size to scan (larger files skip content check but still respect
+# path-based denylists).
+_MEDIA_CONTENT_GUARD_EXTS = frozenset({
+    ".txt", ".md", ".json", ".yaml", ".yml", ".env", ".xml", ".csv", ".log"
+})
+_MEDIA_CONTENT_GUARD_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+
+
+def _check_file_content_for_secrets(resolved: Path) -> bool:
+    """Check if file content contains recognizable credential patterns.
+
+    Scans only text-like files up to a size limit to avoid I/O burden.
+    Returns True if credential-shaped content is detected (file should be rejected).
+    Returns False if file is safe or exempt from content scanning.
+
+    Args:
+        resolved: Fully resolved Path object pointing to the file.
+
+    Returns:
+        True if credentials detected (reject delivery), False otherwise.
+    """
+    # Only scan text-like file types: check both suffix (.json, .txt)
+    # and full name (.env, .envrc) for dotfile formats.
+    suffix = resolved.suffix.lower()
+    name = resolved.name.lower()
+    if suffix not in _MEDIA_CONTENT_GUARD_EXTS and name not in _MEDIA_CONTENT_GUARD_EXTS:
+        return False
+
+    # Skip content check for large files (but denylist still applies)
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        return False
+    if size > _MEDIA_CONTENT_GUARD_MAX_SIZE:
+        return False
+
+    # Read and scan file content for credential shapes
+    try:
+        with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError):
+        # If we can't read as text, assume safe (not a credential file)
+        return False
+
+    return contains_secret_shape(content)
+
+
 def _path_is_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -1494,6 +1538,17 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not resolved.is_file():
         return None
 
+    # Helper to finalize path with content guard check.
+    def _finalize_with_content_guard(safe_path: str) -> Optional[str]:
+        """Return path after content guard check, None if credentials detected."""
+        if _check_file_content_for_secrets(resolved):
+            logger.warning(
+                "File rejected: path contains credential-like content: %s",
+                _log_safe_path(safe_path),
+            )
+            return None
+        return safe_path
+
     # Cache / operator allowlist is always honored — these are unconditionally
     # trusted regardless of mode.
     for root in _media_delivery_allowed_roots():
@@ -1502,7 +1557,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         except (OSError, RuntimeError, ValueError):
             continue
         if _path_is_within(resolved, resolved_root):
-            return str(resolved)
+            return _finalize_with_content_guard(str(resolved))
 
     # Non-strict mode (default): accept anything not on the denylist.
     # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, and the
@@ -1514,7 +1569,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not _media_delivery_strict_mode():
         if _path_under_denied_prefix(resolved):
             return None
-        return str(resolved)
+        return _finalize_with_content_guard(str(resolved))
 
     # Strict mode: fall back to recency-based trust for freshly-produced
     # files (e.g. ``pandoc -o /tmp/report.pdf`` or
@@ -1524,7 +1579,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     window = _media_delivery_recency_seconds()
     if window > 0 and not _path_under_denied_prefix(resolved):
         if _file_is_recently_produced(resolved, window):
-            return str(resolved)
+            return _finalize_with_content_guard(str(resolved))
 
     return None
 

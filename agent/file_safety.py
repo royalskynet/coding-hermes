@@ -177,6 +177,22 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
 
+# Sensitive subdirectories under $HOME that must never be accessed for
+# credential delivery. Shared between write denial checks (agent/file_safety.py)
+# and media delivery path validation (gateway/platforms/base.py).
+CREDENTIAL_HOME_SUBPATHS = (
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".config",
+    ".azure",
+    ".gcloud",
+    ".creds",
+)
+
+
 # Common secret-bearing project-local environment file basenames.
 # These are blocked because .env files routinely contain API keys,
 # database passwords, and other credentials.

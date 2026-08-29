@@ -9,8 +9,10 @@ which has provider-specific conditionals for max_tokens defaults,
 reasoning configuration, temperature handling, and extra_body assembly.
 """
 
+import json
 from typing import Any, Dict
 
+from agent import dsml_tool_calls
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
@@ -735,6 +737,27 @@ class ChatCompletionsTransport(ProviderTransport):
         # loop's refusal handler surfaces it clearly and stops. ``refusal`` is
         # ``None`` for normal responses, so this is a no-op in the common case.
         content = msg.content
+
+        # DeepSeek v4 fallback: when the structured ``tool_calls`` field is
+        # empty but content carries DeepSeek's DSML inline tool-call
+        # sentinel (see agent/dsml_tool_calls.py), parse it into real tool
+        # calls instead of forwarding the raw sentinel as text. Only runs
+        # when structured tool_calls is empty, so normal providers/turns
+        # are untouched and nothing is ever double-parsed.
+        if not tool_calls and isinstance(content, str) and dsml_tool_calls.SENTINEL_HINT in content:
+            _dsml_remaining, _dsml_calls = dsml_tool_calls.parse_dsml_tool_calls(content)
+            if _dsml_calls:
+                content = _dsml_remaining or None
+                tool_calls = [
+                    ToolCall(
+                        id=f"dsml_call_{_i}",
+                        name=_call["name"],
+                        arguments=json.dumps(_call["arguments"]),
+                        provider_data=None,
+                    )
+                    for _i, _call in enumerate(_dsml_calls, start=1)
+                ]
+
         refusal = getattr(msg, "refusal", None)
         if refusal is None and hasattr(msg, "model_extra"):
             _msg_extra = getattr(msg, "model_extra", None) or {}

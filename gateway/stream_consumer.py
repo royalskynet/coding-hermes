@@ -32,6 +32,12 @@ from gateway.config import (
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
 )
+from agent.agent_runtime_helpers import (
+    DSML_CLOSE_TOOL_CALLS_TAG,
+    DSML_OPEN_TOOL_CALLS_TAG,
+    TOOL_CALL_TAG_NAMES,
+)
+from agent.redact import redact_sensitive_text as _redact_sensitive_text
 from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
@@ -172,17 +178,29 @@ class GatewayStreamConsumer:
     # progressive edits for the remainder of the stream.
     _MAX_FLOOD_STRIKES = 3
 
-    # Reasoning/thinking tags that models emit inline in content.
-    # Must stay in sync with cli.py _OPEN_TAGS/_CLOSE_TAGS and
-    # run_agent.py _strip_think_blocks() tag variants.
+    # Reasoning/thinking tags that models emit inline in content, PLUS
+    # tool-call tags some open models leak into content instead of the
+    # structured tool_calls field. Reasoning names must stay in sync with
+    # cli.py _OPEN_TAGS/_CLOSE_TAGS and run_agent.py _strip_think_blocks()
+    # tag variants; the tool-call names/DSML sentinel come from
+    # agent.agent_runtime_helpers (TOOL_CALL_TAG_NAMES /
+    # DSML_OPEN_TOOL_CALLS_TAG / DSML_CLOSE_TOOL_CALLS_TAG) — the single
+    # shared source that also feeds cli.py's _strip_reasoning_tags, so this
+    # consumer no longer has zero tool-call awareness. This state machine
+    # isn't tag-pair-strict (any close tag ends whatever block is open,
+    # same as it always did for reasoning tags), which is fine for a
+    # best-effort streaming safety net — the real DSML→ToolCall parse
+    # happens post-stream in agent/dsml_tool_calls.py.
     _OPEN_THINK_TAGS = (
         "<REASONING_SCRATCHPAD>", "<think>", "<reasoning>",
         "<THINKING>", "<thinking>", "<thought>",
-    )
+        DSML_OPEN_TOOL_CALLS_TAG,
+    ) + tuple(f"<{name}" for name in TOOL_CALL_TAG_NAMES)
     _CLOSE_THINK_TAGS = (
         "</REASONING_SCRATCHPAD>", "</think>", "</reasoning>",
         "</THINKING>", "</thinking>", "</thought>",
-    )
+        DSML_CLOSE_TOOL_CALLS_TAG,
+    ) + tuple(f"</{name}>" for name in TOOL_CALL_TAG_NAMES)
 
     # Class-wide monotonic counter for native-streaming draft ids.  Telegram
     # animates a draft when the same draft_id is reused across consecutive
@@ -1202,8 +1220,31 @@ class GatewayStreamConsumer:
         delivered separately via ``_deliver_media_from_response()`` after the
         stream finishes — we just need to hide the raw directives from the
         user.
+
+        Also redacts credentials.  The non-streaming path is sanitized in
+        ``gateway/run.py::_sanitize_gateway_final_response``, but a streamed
+        turn sets ``already_sent=True`` and that sanitized copy is never
+        delivered — so without this the streaming path had *no* secret
+        redaction at all (2026-08-29 credential-leak incident).
+
+        Why here and not per-delta: every one of this class's send/edit
+        sites funnels through this method, and they all pass *accumulated*
+        text (``self._accumulated`` or a newline-split slice of it), never a
+        single raw delta.  Redacting a lone delta would be worse than
+        useless — a token split across chunks (``ghp_ABC`` | ``DEF123``)
+        matches nothing on either side, giving the appearance of protection
+        with none of it.  Chunk splits happen at ``\\n`` boundaries
+        (see the ``rfind("\\n")`` split), and secrets contain no newline, so
+        a token is never split across two sends.
+
+        Residual: while a token is still arriving, the tail of the
+        accumulated text may hold an incomplete prefix that matches nothing
+        and is briefly visible.  An incomplete credential is not a usable
+        credential, so this is accepted rather than paying for a hold-back
+        buffer on every edit tick.
         """
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        cleaned = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        return _redact_sensitive_text(cleaned, force=True)
 
     async def _send_new_chunk(
         self,

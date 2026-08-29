@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent import dsml_tool_calls
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
@@ -3014,6 +3015,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         content_parts: list = []
         tool_calls_acc: dict = {}
         tool_gen_notified: set = set()
+        # DeepSeek v4 sometimes inlines tool calls into `content` as a DSML
+        # sentinel block (see agent/dsml_tool_calls.py) instead of using the
+        # structured tool_calls delta. Raw sentinel text must never reach the
+        # user, so once the accumulated content is recognized as a DSML
+        # block, stop firing further content deltas; the full content is
+        # parsed for real tool calls after the stream ends.
+        _dsml_stream_state = {"suppressed": False}
         # Ollama-compatible endpoints reuse index 0 for every tool call
         # in a parallel batch, distinguishing them only by id.  Track
         # the last seen id per raw index so we can detect a new tool
@@ -3216,9 +3224,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if delta and delta.content:
                 content_parts.append(delta.content)
                 if not tool_calls_acc:
-                    _fire_first_delta()
-                    agent._fire_stream_delta(delta.content)
-                    deltas_were_sent["yes"] = True
+                    if not _dsml_stream_state["suppressed"] and dsml_tool_calls.looks_like_dsml_head(
+                        "".join(content_parts)
+                    ):
+                        _dsml_stream_state["suppressed"] = True
+                    if not _dsml_stream_state["suppressed"]:
+                        _fire_first_delta()
+                        agent._fire_stream_delta(delta.content)
+                        deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
@@ -3395,6 +3408,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         arguments=arguments,
                     ),
                 ))
+        elif full_content and dsml_tool_calls.SENTINEL_HINT in full_content:
+            # No structured tool_calls came through this stream, but the
+            # accumulated content carries DeepSeek's DSML inline tool-call
+            # sentinel (raw streaming of it was already suppressed above).
+            # Parse it into real tool calls; only fall through to plain text
+            # if nothing parseable was found.
+            _dsml_remaining, _dsml_calls = dsml_tool_calls.parse_dsml_tool_calls(full_content)
+            if _dsml_calls:
+                full_content = _dsml_remaining or None
+                mock_tool_calls = [
+                    SimpleNamespace(
+                        id=f"dsml_call_{_i}",
+                        type="function",
+                        extra_content=None,
+                        function=SimpleNamespace(
+                            name=_call["name"],
+                            arguments=json.dumps(_call["arguments"]),
+                        ),
+                    )
+                    for _i, _call in enumerate(_dsml_calls, start=1)
+                ]
 
         # Zero-chunk guard: stream yielded nothing usable — a provider/upstream
         # error or malformed SSE, not a legitimate empty completion. Raise so the

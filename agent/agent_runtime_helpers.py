@@ -53,7 +53,31 @@ _MAX_AUTH_REFRESH_ATTEMPTS = 2
 
 
 _REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
-_TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
+
+# ---------------------------------------------------------------------------
+# Tool-call tag stripping — SINGLE SOURCE OF TRUTH for this project.
+# Previously duplicated (and drifted) across three call sites:
+#   A. this module's _TOOL_CALL_BLOCK_PATTERNS (below)
+#   B. cli.py::_strip_reasoning_tags — hard-coded copy-paste tuple
+#   C. gateway/stream_consumer.py — had NO tool-call tags at all
+# cli.py and gateway/stream_consumer.py now import TOOL_CALL_TAG_NAMES /
+# DSML_OPEN_TOOL_CALLS_TAG / DSML_CLOSE_TOOL_CALLS_TAG from here instead of
+# hard-coding their own copies.
+# ---------------------------------------------------------------------------
+
+# ASCII tool-call XML tags some open models (Gemma family) leak into content
+# instead of using the structured tool_calls field. openclaw/openclaw#67318.
+TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
+
+# DeepSeek v4's DSML inline tool-call sentinel (see agent/dsml_tool_calls.py
+# for the full grammar + how it's ground-truthed). The sentinel is a DOUBLED
+# fullwidth U+FF5C pipe around the literal "DSML" (``｜｜DSML｜｜``) — never a
+# plain ASCII tag name, so it can never match the `<{name}\b` patterns below.
+# The normal parser (agent/dsml_tool_calls.py) strips well-formed blocks
+# before they ever reach strip_think_blocks(); these patterns are the safety
+# net for whatever the parser didn't run on or couldn't close.
+DSML_OPEN_TOOL_CALLS_TAG = "<｜｜DSML｜｜tool_calls>"
+DSML_CLOSE_TOOL_CALLS_TAG = "</｜｜DSML｜｜tool_calls>"
 
 _REASONING_BLOCK_PATTERNS = tuple(
     re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE)
@@ -62,7 +86,19 @@ _REASONING_BLOCK_PATTERNS = tuple(
 
 _TOOL_CALL_BLOCK_PATTERNS = tuple(
     re.compile(rf"<{name}\b[^>]*>.*?</{name}>", re.DOTALL | re.IGNORECASE)
-    for name in _TOOL_CALL_TAG_NAMES
+    for name in TOOL_CALL_TAG_NAMES
+) + (
+    re.compile(
+        re.escape(DSML_OPEN_TOOL_CALLS_TAG) + r".*?" + re.escape(DSML_CLOSE_TOOL_CALLS_TAG),
+        re.DOTALL,
+    ),
+)
+
+# Unterminated DSML block — open sentinel with no matching close (truncated
+# stream / model cut off mid-emission). Strip from the tag to end of string,
+# mirroring _UNTERMINATED_REASONING_BLOCK_PATTERN's approach below.
+_DSML_UNTERMINATED_BLOCK_PATTERN = re.compile(
+    re.escape(DSML_OPEN_TOOL_CALLS_TAG) + r".*$", re.DOTALL
 )
 
 # Named <function name=...> blocks — see strip_think_blocks step 1c for the
@@ -86,7 +122,8 @@ _ORPHAN_REASONING_TAG_PATTERN = re.compile(
 )
 
 _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
-    rf'</(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function)>\s*',
+    rf'</(?:{"|".join(TOOL_CALL_TAG_NAMES)}|function)>\s*'
+    r'|</｜｜DSML｜｜(?:tool_calls|invoke|parameter)(?:\s[^>]*)?>\s*',
     re.IGNORECASE,
 )
 
@@ -883,6 +920,10 @@ def strip_think_blocks(agent, content: str) -> str:
     #    Strip from the tag to end of string.  Fixes #8878 / #9568
     #    (MiniMax M2.7 leaking raw reasoning into assistant content).
     content = _UNTERMINATED_REASONING_BLOCK_PATTERN.sub('', content)
+    # 2b. Unterminated DSML tool-call block — open sentinel, no closer
+    #     (truncated stream). Strip from the tag to end of string, same
+    #     rationale as 2 above.
+    content = _DSML_UNTERMINATED_BLOCK_PATTERN.sub('', content)
     # 3. Stray orphan open/close tags that slipped through.
     content = _ORPHAN_REASONING_TAG_PATTERN.sub('', content)
     # 3b. Stray tool-call closers. (We do NOT strip bare <function> or

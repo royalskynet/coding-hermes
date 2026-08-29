@@ -54,6 +54,11 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
+from agent.agent_runtime_helpers import (
+    DSML_CLOSE_TOOL_CALLS_TAG,
+    DSML_OPEN_TOOL_CALLS_TAG,
+    TOOL_CALL_TAG_NAMES,
+)
 from agent.interrupt_compat import request_hard_interrupt
 
 # prompt_toolkit for fixed input area TUI
@@ -285,8 +290,7 @@ def _strip_reasoning_tags(text: str) -> str:
             flags=re.IGNORECASE,
         )
     # Tool-call XML blocks (openclaw/openclaw#67318).
-    for tc_tag in ("tool_call", "tool_calls", "tool_result",
-                   "function_call", "function_calls"):
+    for tc_tag in TOOL_CALL_TAG_NAMES:
         cleaned = re.sub(
             rf"<{tc_tag}\b[^>]*>.*?</{tc_tag}>\s*",
             "",
@@ -302,9 +306,24 @@ def _strip_reasoning_tags(text: str) -> str:
         cleaned,
         flags=re.DOTALL | re.IGNORECASE,
     )
+    # DeepSeek DSML inline tool-call sentinel — closed pair, then
+    # unterminated-to-end-of-text (mirrors the reasoning-tag passes above).
+    cleaned = re.sub(
+        re.escape(DSML_OPEN_TOOL_CALLS_TAG) + r".*?" + re.escape(DSML_CLOSE_TOOL_CALLS_TAG) + r"\s*",
+        "",
+        cleaned,
+        flags=re.DOTALL,
+    )
+    cleaned = re.sub(
+        re.escape(DSML_OPEN_TOOL_CALLS_TAG) + r".*$",
+        "",
+        cleaned,
+        flags=re.DOTALL,
+    )
     # Stray tool-call close tags.
     cleaned = re.sub(
-        r'</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*',
+        rf'</(?:{"|".join(TOOL_CALL_TAG_NAMES)}|function)>\s*'
+        r'|</｜｜DSML｜｜(?:tool_calls|invoke|parameter)(?:\s[^>]*)?>\s*',
         '',
         cleaned,
         flags=re.IGNORECASE,

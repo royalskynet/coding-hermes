@@ -25830,7 +25830,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _reconcile_res = await _sc_adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
-                            content=_final,
+                            # Redacted here because this edit bypasses
+                            # _sanitize_gateway_final_response — that sanitized
+                            # copy is discarded once already_sent is set, so
+                            # the reconciliation path would otherwise deliver
+                            # unscrubbed text (2026-08-29 leak incident).
+                            content=_redact_gateway_user_facing_secrets(_final),
                             finalize=True,
                         )
                         if getattr(_reconcile_res, "success", True):
@@ -25864,7 +25869,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
-                            content=response["final_response"],
+                            # Same bypass as the stale-finalize branch above:
+                            # sanitize here or this edit ships raw text.
+                            content=_redact_gateway_user_facing_secrets(
+                                response["final_response"]
+                            ),
                             finalize=True,
                         )
                         response["already_sent"] = True
