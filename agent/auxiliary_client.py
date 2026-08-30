@@ -2802,6 +2802,29 @@ def _read_main_model_for_aux() -> str:
     return model
 
 
+_OPENAI_API_HOSTS = ("api.openai.com",)
+
+
+def _openai_key_if_openai_host(aux_base_url: str) -> str:
+    """Return ``OPENAI_API_KEY`` only when *aux_base_url* is OpenAI's own host.
+
+    Companion gate to ``_read_main_api_key_if_same_host`` for the #91308
+    cross-host leak. ``_scoped_key_env`` scopes by *profile*, not by
+    destination, so using it as a bare fallback in the custom-endpoint chain
+    sends OPENAI_API_KEY to whatever host the base_url names. Anything that
+    isn't OpenAI falls through to ``no-key-required`` (→ 401), which is the
+    intended fail-safe.
+
+    An empty/unparseable base_url returns "" rather than the key: a custom
+    provider whose destination we cannot determine must not be trusted with
+    a credential.
+    """
+    aux_host = base_url_hostname(aux_base_url)
+    if not aux_host or aux_host.lower() not in _OPENAI_API_HOSTS:
+        return ""
+    return _scoped_key_env("OPENAI_API_KEY")
+
+
 def _read_main_api_key_if_same_host(aux_base_url: str) -> str:
     """Return the main api_key only when *aux_base_url* points at the same
     host as the main model's base_url.
@@ -5992,10 +6015,19 @@ def resolve_provider_client(
         custom_key = ""
         if explicit_base_url:
             custom_base = _to_openai_base_url(explicit_base_url).strip()
+            # Credential order matters here — see #91308 (cross-host key leak).
+            # ``_read_main_api_key_if_same_host`` is host-gated and returns ""
+            # on mismatch, but ``_scoped_key_env`` is only *profile*-scoped: it
+            # hands back OPENAI_API_KEY no matter where custom_base points. So
+            # it must itself be host-gated, otherwise any custom base_url — a
+            # typo, or one chosen by prompt injection — receives the key as a
+            # Bearer token. Reordering alone does not fix this; the fallback
+            # has to be removed for foreign hosts, leaving the documented
+            # fail-safe (``no-key-required`` → 401).
             custom_key = (
                 (explicit_api_key or "").strip()
-                or _scoped_key_env("OPENAI_API_KEY")
                 or _read_main_api_key_if_same_host(custom_base)
+                or _openai_key_if_openai_host(custom_base)
                 or "no-key-required"  # local servers don't need auth
             )
             if not custom_base:

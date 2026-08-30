@@ -229,6 +229,12 @@ def get_read_block_error(path: str) -> Optional[str]:
         own projects. The agent helping debug a project shouldn't normally
         need to read these — ``.env.example`` is the documented-shape
         substitute.
+      * Sensitive subdirectories under $HOME named in
+        ``CREDENTIAL_HOME_SUBPATHS`` (``.ssh``, ``.creds``, ``.aws``,
+        ``.gnupg``, ``.kube``, ``.docker``, ``.config``, ``.azure``,
+        ``.gcloud``) — a prefix match, not a basename match, so a file like
+        ``~/.creds/creds.json`` or ``~/.creds/github/anything.env`` is
+        blocked regardless of its own name.
 
     **This is NOT a security boundary.** The terminal tool runs as the
     same OS user with shell access; the agent can still ``cat auth.json``
@@ -313,6 +319,40 @@ def get_read_block_error(path: str) -> Optional[str]:
                     "(Defense-in-depth — not a security boundary; the "
                     "terminal tool can still bypass.)"
                 )
+
+    # Sensitive subdirectories under $HOME (``.ssh``, ``.creds``, ``.aws``,
+    # etc. — see CREDENTIAL_HOME_SUBPATHS docstring). Prefix match against
+    # the live $HOME so anything living inside these trees is blocked,
+    # regardless of basename — this closes the gap where a credential
+    # bundle like ``~/.creds/creds.json`` (not named ``.env``) was
+    # previously readable. Shared with the write-denylist / media-delivery
+    # widening in gateway/platforms/base.py so read and write/exfil sides
+    # can't drift apart (see module docstring above).
+    try:
+        home = Path(os.path.expanduser("~")).resolve()
+    except Exception:
+        home = None
+    if home is not None:
+        for sub in CREDENTIAL_HOME_SUBPATHS:
+            try:
+                denied_dir = (home / sub).resolve()
+            except Exception:
+                continue
+            if resolved == denied_dir:
+                return (
+                    f"Access denied: {path} is under a protected credential/config "
+                    "directory and cannot be read directly. (Defense-in-depth — not "
+                    "a security boundary; the terminal tool can still bypass.)"
+                )
+            try:
+                resolved.relative_to(denied_dir)
+            except ValueError:
+                continue
+            return (
+                f"Access denied: {path} is under a protected credential/config "
+                "directory and cannot be read directly. (Defense-in-depth — not "
+                "a security boundary; the terminal tool can still bypass.)"
+            )
 
     # mcp-tokens/: directory prefix match — anything inside is OAuth
     # token material.
