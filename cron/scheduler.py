@@ -4104,7 +4104,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 # 等同「空 response」語意 —— 不得記 ok（工單 C2 step 4:
                 # [SILENT] 必須 degraded/failed, watchdog 也不許冒充 primary success）。
                 # success 設 False → mark_job_run 寫非 ok status。
-                success = False
+                # no_agent script 除外：watchdog 成功時 stdout 刻意為空是
+                # 成功哨兵（不送 Telegram），不是「沒產出」—— 不得翻成失敗
+                # （#qmd-koko-vault-update 08-27 起被誤記 failed）。
+                if not job.get("no_agent"):
+                    success = False
 
             if should_deliver:
                 unresolved_origin = (
