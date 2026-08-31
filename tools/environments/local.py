@@ -25,22 +25,23 @@ _IS_WINDOWS = platform.system() == "Windows"
 _SEATBELT_PROFILE = None
 _SEATBELT_AVAILABLE = False
 
+_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
 def _resolve_seatbelt_profile():
-    """Return (sandbox_exec, profile_path) or (None, None) on non-macOS/missing."""
+    """Return ("/usr/bin/sandbox-exec", profile_path_str) or (None, None) on non-macOS/missing."""
     global _SEATBELT_PROFILE, _SEATBELT_AVAILABLE
-    if not _SEATBELT_AVAILABLE and sys.platform == "darwin":
+    if _SEATBELT_AVAILABLE:
+        return _SANDBOX_EXEC, _SEATBELT_PROFILE
+    if sys.platform == "darwin" and _SEATBELT_PROFILE is None:
         profile = Path(__file__).parent.parent / "execute_code_confine.sbpl"
-        if profile.exists():
-            try:
-                import shutil
-                if shutil.which("sandbox-exec"):
-                    _SEATBELT_PROFILE = str(profile)
-                    _SEATBELT_AVAILABLE = True
-                    logger.info("terminal: sandbox-exec confinement enabled (profile: %s)", _SEATBELT_PROFILE)
-                    return _SEATBELT_PROFILE, profile
-            except Exception:
-                pass
-        logger.warning("terminal: seatbelt profile not found at %s, running without OS confinement", profile if 'profile' in locals() else "unknown")
+        if profile.exists() and os.access(_SANDBOX_EXEC, os.X_OK):
+            _SEATBELT_PROFILE = str(profile)
+            _SEATBELT_AVAILABLE = True
+            logger.info("terminal: sandbox-exec confinement enabled (profile: %s)", _SEATBELT_PROFILE)
+            return _SANDBOX_EXEC, _SEATBELT_PROFILE
+        # sentinel so we only warn once
+        _SEATBELT_PROFILE = ""
+        logger.warning("terminal: seatbelt profile not found at %s, running without OS confinement", profile)
     return None, None
 
 logger = logging.getLogger(__name__)

@@ -786,7 +786,7 @@ class ProcessRegistry:
             args = [user_shell, "-lic", f"set +m; {safe_command}"]
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {safe_command}"],
+            args,
             text=True,
             cwd=session.cwd,
             env=bg_env,
