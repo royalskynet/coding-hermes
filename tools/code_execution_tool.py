@@ -1493,8 +1493,23 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
 
+        # --- Seatbelt confinement (macOS only) ---
+        # Wrap the child process in sandbox-exec with the execute_code_confine.sbpl
+        # profile to block credential directory reads at the OS level.
+        # Only applies to the local UDS backend on macOS; non-macOS or missing
+        # profile falls back to original behavior with a WARNING log.
+        _use_seatbelt = False
+        if sys.platform == "darwin":
+            _profile_path = os.path.join(os.path.dirname(__file__), "execute_code_confine.sbpl")
+            if os.path.exists(_profile_path):
+                _use_seatbelt = True
+                logger.info("execute_code: sandbox-exec confinement enabled (profile: %s)", _profile_path)
+            else:
+                logger.warning("execute_code: seatbelt profile not found at %s, running without OS confinement", _profile_path)
+
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            (["/usr/bin/sandbox-exec", "-f", _profile_path] if _use_seatbelt else [])
+            + [_child_python, _script_path],
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
@@ -1503,6 +1518,8 @@ def execute_code(
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
+        if not _use_seatbelt and sys.platform == "darwin":
+            logger.warning("execute_code: running WITHOUT seatbelt confinement (macOS but profile missing or sandbox-exec unavailable)")
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout

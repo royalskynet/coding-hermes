@@ -1,0 +1,10 @@
+(version 1)
+(allow default)
+(deny file-read* file-read-metadata
+  (subpath "/Users/51mini/.creds")
+  (subpath "/Users/51mini/.ssh")
+  (subpath "/Users/51mini/.aws")
+  (subpath "/Users/51mini/.gnupg")
+  (subpath "/Users/51mini/.openclaw/service-env")
+  (regex #"/\.env(\.[^/]+)?$")
+  (subpath "/Users/51mini/.anthropic_oauth.json"))
