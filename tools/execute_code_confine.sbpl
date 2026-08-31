@@ -6,5 +6,5 @@
   (subpath "/Users/51mini/.aws")
   (subpath "/Users/51mini/.gnupg")
   (subpath "/Users/51mini/.openclaw/service-env")
-  (regex #"/\.env(\.[^/]+)?$")
+  (regex #"/[^/]*\.env(\.[^/]+)?$")
   (subpath "/Users/51mini/.anthropic_oauth.json"))
