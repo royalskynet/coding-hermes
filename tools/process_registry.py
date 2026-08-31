@@ -42,7 +42,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _resolve_seatbelt_profile
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -777,6 +777,13 @@ class ProcessRegistry:
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+
+        # Seatbelt wrapping for background local spawns
+        sb_exec, sb_profile = _resolve_seatbelt_profile()
+        if sb_exec and sb_profile:
+            args = [sb_exec, "-f", sb_profile, user_shell, "-lic", f"set +m; {safe_command}"]
+        else:
+            args = [user_shell, "-lic", f"set +m; {safe_command}"]
 
         proc = subprocess.Popen(
             [user_shell, "-lic", f"set +m; {safe_command}"],

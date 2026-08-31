@@ -19,6 +19,30 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
 
+# --- Seatbelt confinement for local terminal spawn ---
+# Reusable helper: prepend sandbox-exec when on macOS and the profile exists.
+# Applies to all local terminal subprocess spawns to inherit credential denial.
+_SEATBELT_PROFILE = None
+_SEATBELT_AVAILABLE = False
+
+def _resolve_seatbelt_profile():
+    """Return (sandbox_exec, profile_path) or (None, None) on non-macOS/missing."""
+    global _SEATBELT_PROFILE, _SEATBELT_AVAILABLE
+    if not _SEATBELT_AVAILABLE and sys.platform == "darwin":
+        profile = Path(__file__).parent.parent / "execute_code_confine.sbpl"
+        if profile.exists():
+            try:
+                import shutil
+                if shutil.which("sandbox-exec"):
+                    _SEATBELT_PROFILE = str(profile)
+                    _SEATBELT_AVAILABLE = True
+                    logger.info("terminal: sandbox-exec confinement enabled (profile: %s)", _SEATBELT_PROFILE)
+                    return _SEATBELT_PROFILE, profile
+            except Exception:
+                pass
+        logger.warning("terminal: seatbelt profile not found at %s, running without OS confinement", profile if 'profile' in locals() else "unknown")
+    return None, None
+
 logger = logging.getLogger(__name__)
 
 
@@ -1528,6 +1552,11 @@ class LocalEnvironment(BaseEnvironment):
         _popen_cwd = self.cwd
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+
+        # Seatbelt wrapping for foreground local spawns
+        sb_exec, sb_profile = _resolve_seatbelt_profile()
+        if sb_exec and sb_profile:
+            args = [sb_exec, "-f", sb_profile] + args
 
         proc = subprocess.Popen(
             args,
