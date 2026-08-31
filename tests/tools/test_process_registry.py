@@ -807,9 +807,14 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("cd /app && node server.js &>/tmp/srv.log &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0]
-        # The command passed to Popen should be the REWRITTEN version
-        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
+        argv = captured_cmd[0]
+        # With seatbelt wrapping, argv[0..2] = sandbox-exec, -f, profile
+        assert argv[0] == "/usr/bin/sandbox-exec"
+        assert argv[1] == "-f"
+        assert argv[2].endswith("execute_code_confine.sbpl")
+        # Original rewritten command is in the shell -lic argument (argv[5])
+        shell_arg = argv[5]  # [sandbox-exec, -f, profile, shell, -lic, "set +m; ..."]
+        assert "&& { node server.js &>/tmp/srv.log & }" in shell_arg
 
     def test_simple_background_preserved(self, registry):
         """Simple cmd & (no &&) must NOT be rewritten — no subshell bug."""
@@ -832,9 +837,14 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("sleep 5 &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0][2]
-        # Simple background must remain as-is
-        assert "sleep 5 &" in shell_cmd
+        argv = captured_cmd[0]
+        # With seatbelt wrapping, argv[0..2] = sandbox-exec, -f, profile
+        assert argv[0] == "/usr/bin/sandbox-exec"
+        assert argv[1] == "-f"
+        assert argv[2].endswith("execute_code_confine.sbpl")
+        # Original simple command is in the shell -lic argument (argv[5])
+        shell_arg = argv[5]  # [sandbox-exec, -f, profile, shell, -lic, "set +m; ..."]
+        assert "sleep 5 &" in shell_arg
 
     def test_pty_path_uses_rewritten_command(self, registry):
         """PTY spawn path must also use the rewritten command (issue #68915)."""
